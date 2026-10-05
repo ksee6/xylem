@@ -3,27 +3,31 @@
 
 #include <Xylem/Format.hpp>
 #include <Xylem/Query.hpp>
-#include <Collection/Array.hpp>
-#include <Collection/Map.hpp>
-#include <Collection/String.hpp>
-#include <Collection/Tree.hpp>
+#include <Ksee/Array.hpp>
+#include <Ksee/Map.hpp>
+#include <Ksee/String.hpp>
+#include <Ksee/Tree.hpp>
 
 namespace Xylem {
+
+using namespace Ksee;
 
 class XylemEngine; // Forward declaration
 
 struct QueryResult {
     int code = -1;
-    Collection::TreeBranch* treeResult = nullptr;
-    Collection::Array<Collection::Map<Collection::String, Collection::String>> readRows;
+    Tree<void>* treeResult = nullptr;
+    Array<Map<String, String>> readRows;
+
+    String getRowsJson() const;
 };
 
 class QueryParser {
 public:
-    static QueryResult execute(XylemEngine* engine, const Collection::String& query, const Collection::Array<Collection::String>& args = Collection::Array<Collection::String>());
+    static QueryResult execute(XylemEngine* engine, const String& query, const Array<String>& args = Array<String>(), u64 now = 0);
 
     // Visible for testing or internal composition
-    static Collection::Array<Collection::String> tokenize(const Collection::String& query, const Collection::Array<Collection::String>& args);
+    static Array<String> tokenize(const String& query, const Array<String>& args);
 
 };
 

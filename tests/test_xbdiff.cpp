@@ -1,8 +1,8 @@
 #include <Xylem/XBDiff.hpp>
-#include <Terminal/Format.hpp>
+#include <Ksee/Terminal/Format.hpp>
 
 using namespace Xylem;
-using namespace Terminal;
+using namespace Ksee;
 
 int main() {
     Info("--- XBDiff Unit Tests ---");

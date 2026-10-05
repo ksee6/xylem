@@ -1,10 +1,10 @@
 #include <Xylem/Xylem.hpp>
 #include <Xylem/XBDiff.hpp>
 #include <Xylem/CryptItem.hpp>
-#include <Xi/Random.hpp>
-#include <Security/Crypto.hpp>
+#include <Ksee/Math/Random.hpp>
+#include <Ksee/Crypto/Hash.hpp>
 #include <stdint.h>
-#include <stdio.h>
+
 
 namespace Xylem {
 
@@ -148,10 +148,11 @@ bool XylemEngine::format() {
         }
     }
 
+    u32 bamAllocBlocks = (totalBlocks >= 100) ? (BAM_DEFAULT_COUNT * 2) : BAM_DEFAULT_COUNT;
     u32 sysStart = (superBlockIdx + 2) % totalBlocks;
     while (true) {
         bool ok = true;
-        for (u32 i = 0; i < BAM_DEFAULT_COUNT + JNL_DEFAULT_COUNT; ++i) {
+        for (u32 i = 0; i < bamAllocBlocks + JNL_DEFAULT_COUNT; ++i) {
             if (!isSafe((sysStart + i) % totalBlocks)) { ok = false; break; }
         }
         if (ok) break;
@@ -159,7 +160,7 @@ bool XylemEngine::format() {
     }
 
     u32 newBamStart = sysStart;
-    u32 newJnlStart = (sysStart + BAM_DEFAULT_COUNT) % totalBlocks;
+    u32 newJnlStart = (sysStart + bamAllocBlocks) % totalBlocks;
 
     allocator = new Allocator(device);
     allocator->bamStartBlock = newBamStart;
@@ -171,7 +172,7 @@ bool XylemEngine::format() {
     allocator->bam[(superBlockIdx + 1) % totalBlocks].setStatus(BlockStatus::RESERVED);
     allocator->bam[(superBlockIdx + 1) % totalBlocks].setType(BlockType::SUPER);
 
-    for (u32 i = 0; i < BAM_DEFAULT_COUNT; ++i) {
+    for (u32 i = 0; i < bamAllocBlocks; ++i) {
         allocator->bam[(newBamStart + i) % totalBlocks].setStatus(BlockStatus::RESERVED);
         allocator->bam[(newBamStart + i) % totalBlocks].setType(BlockType::BAM);
     }
@@ -195,7 +196,9 @@ bool XylemEngine::format() {
     this->currentSuperblockIdx = superBlockIdx;
 
     delete allocator; allocator = nullptr;
-    delete device;    device    = nullptr;
+    if (device && (device->config.onDeviceWrite || device->config.onDeviceRead)) {
+        delete device;    device    = nullptr;
+    }
     return true;
 }
 
@@ -286,50 +289,6 @@ bool XylemEngine::mount() {
         return val;
     };
 
-    tableStore->saveToDisk = [this, writeVLU](u64 id, Map<String, String>* row) {
-        if (!this->blobStore) return;
-        String key = "ROW_" + String::from(id);
-        this->blobStore->removeHash(key); 
-        
-        usz needed = 10; // VLU overhead for count
-        for (auto it = row->begin(); it != row->end(); ++it) {
-            needed += 10 + it->key.size() + 10 + it->value.size(); // VLU + data
-        }
-        String data; data.allocate(needed);
-        u8* ptr = data.data();
-        writeVLU(ptr, row->size());
-        for (auto it = row->begin(); it != row->end(); ++it) {
-            writeVLU(ptr, it->key.size());
-            for (usz i = 0; i < it->key.size(); ++i) *ptr++ = it->key[i];
-            writeVLU(ptr, it->value.size());
-            for (usz i = 0; i < it->value.size(); ++i) *ptr++ = it->value[i];
-        }
-        this->blobStore->writeHash(key, 0, data.slice(0, ptr - data.data()), "");
-    };
-
-    tableStore->fetchFromDisk = [this, readVLU](u64 id) -> Map<String, String>* {
-        if (!this->blobStore) return nullptr;
-        String data = this->blobStore->readHash("ROW_" + String::from(id), 0, 0xFFFFFFFF);
-        if (data.isEmpty()) return nullptr;
-
-        Map<String, String>* row = new Map<String, String>();
-        const u8* ptr = data.data();
-        const u8* end = data.data() + data.size();
-        u64 count = readVLU(ptr, end);
-        for (u64 i = 0; i < count && ptr < end; ++i) {
-            u64 kLen = readVLU(ptr, end);
-            if (end - ptr < (ptrdiff_t)kLen) break;
-            String key; key.allocate(kLen);
-            for (u64 j = 0; j < kLen; ++j) key[j] = *ptr++;
-            u64 vLen = readVLU(ptr, end);
-            if (end - ptr < (ptrdiff_t)vLen) break;
-            String val; val.allocate(vLen);
-            for (u64 j = 0; j < vLen; ++j) val[j] = *ptr++;
-            row->set(key, val);
-        }
-        return row;
-    };
-
     tableStore->saveHNSWToDisk = [this, writeVLU](u64 id, HNSW::Node* n) {
         if (!this->blobStore) return;
         String key = "HNSW_" + String::from(id);
@@ -390,6 +349,7 @@ bool XylemEngine::mount() {
     };
 
     tableStore->loadSchemas();
+    tableStore->loadIdPool();
     journal->recover(tableStore);
 
     // Filter active locks by references in rowHistory
@@ -775,23 +735,14 @@ bool XylemEngine::fixRaw(u64 byteAddress, const String& rawData) {
 // ─── Query Parser ────────────────────────────────────────────────────────────
 
 String XylemEngine::generateId(const String& column) {
-    if (!Xi::_randomInitialized) {
-        Xi::randomSeed(true);
-    }
-    
-    while (true) {
-        u64 part1 = Xi::randomNext();
-        u64 part2 = Xi::randomNext();
-        u64 rId = (part1 << 32) | part2;
-        String idStr = String::from(rId);
-        
-        Array<String> cols; cols.push("id");
-        Array<Clauses> query; query.push(WHERE(column, "=", idStr));
-        auto result = read(cols, query, 1);
-        if (result.size() == 0) {
-            return idStr;
-        }
-    }
+    (void)column;
+    if (!tableStore) return "0";
+    return String(tableStore->claimId());
+}
+
+u64 XylemEngine::claimId() {
+    if (!tableStore) return 0;
+    return tableStore->claimId();
 }
 
 static bool clausesMatchFilter(const Array<Clauses>& query, const Array<Clauses>& filter) {
@@ -825,7 +776,7 @@ static bool clausesMatchFilter(const Array<Clauses>& query, const Array<Clauses>
     return false;
 }
 
-QueryResult XylemEngine::query(const String& queryString, const Array<String>& sanitized) {
+QueryResult XylemEngine::query(const String& queryString, const Array<String>& sanitized, u64 now) {
     ensureMounted();
 
     // Intercept with onQuery if registered
@@ -851,13 +802,13 @@ QueryResult XylemEngine::query(const String& queryString, const Array<String>& s
         }
     }
 
-    return QueryParser::execute(this, queryString, sanitized);
+    return QueryParser::execute(this, queryString, sanitized, now);
 }
 
 // ─── CRUD operations ─────────────────────────────────────────────────────────
 
 Array<Map<String,String>> XylemEngine::read(const Array<String>& columns, const Array<Clauses>& clauses,
-                                             u64 length, u64 page, bool tombstones, u64 txId, bool readAllColumns) {
+                                             u64 length, u64 page, bool tombstones, u64 txId, bool readAllColumns, u64 now) {
     ensureMounted();
     if (!tableStore) return {};
     u64 snapshotSeq = 0;
@@ -887,7 +838,7 @@ Array<Map<String,String>> XylemEngine::read(const Array<String>& columns, const 
         }
     }
 
-    auto dbResults = tableStore->read(columns, clauses, length, page, tombstones, snapshotSeq, txId, readAllColumns);
+    auto dbResults = tableStore->read(columns, clauses, length, page, tombstones, snapshotSeq, txId, readAllColumns, now);
 
     if (overlayResults.size() == 0) {
         return dbResults;
@@ -898,7 +849,7 @@ Array<Map<String,String>> XylemEngine::read(const Array<String>& columns, const 
     Array<Map<String, String>> merged;
 
     if (length > 0 || page > 0) {
-        auto fullDbResults = tableStore->read(columns, clauses, 0, 0, tombstones, snapshotSeq, txId, readAllColumns);
+        auto fullDbResults = tableStore->read(columns, clauses, 0, 0, tombstones, snapshotSeq, txId, readAllColumns, now);
         for (usz i = 0; i < fullDbResults.size(); ++i) {
             String idVal = fullDbResults[i].has("id") ? *fullDbResults[i].get("id") : "";
             if (!idVal.isEmpty()) {
@@ -976,16 +927,48 @@ bool XylemEngine::isWriteBlocked(u64 txId) {
     return false;
 }
 
-int XylemEngine::write(const Array<Clause>& columns, const Array<Clauses>& clauses, u64 txId, const String& encryptionKey) {
+int XylemEngine::write(const Array<Clause>& columns, const Array<Clauses>& clauses, u64 txId, const String& encryptionKey, u64 now) {
     ensureMounted();
     if (isWriteBlocked(txId)) return -1;
+
+    // Check for ::volatile special column
+    bool isVolatile = false;
+    bool volatileExplicitlyFalse = false;
+    Array<Clause> filteredColumns;
+    for (usz i = 0; i < columns.size(); ++i) {
+        const auto& c = columns[i];
+        ParsedCol pc = parseCol(c.col);
+        if (pc.name == "::volatile") {
+            // ::volatile=1 or truthy => volatile row
+            // ::volatile="" or "0" => make persistent (move to flash)
+            if (c.val == "1" || c.val == "true" || c.val == "yes") {
+                isVolatile = true;
+            } else {
+                volatileExplicitlyFalse = true;
+            }
+            // Do NOT store this column
+            continue;
+        }
+        filteredColumns.push(c);
+    }
+
+    // If explicitly setting volatile to false, move matching rows from volatile to flash
+    if (volatileExplicitlyFalse && clauses.size() > 0 && tableStore) {
+        Array<u64> targets = tableStore->getMatchingRowIds(clauses, tableStore->currentSeq, txId);
+        for (u64 rId : targets) {
+            if (tableStore->volatileRows.has(rId)) {
+                tableStore->volatileRows.remove(rId);
+                tableStore->dirtyBlocks.set(rId / 1000, true); // Mark for persistence
+            }
+        }
+    }
 
     // Overlay writes
     bool skipXylem = false;
     for (usz i = 0; i < overlayWrites.size(); ++i) {
         const auto& reg = overlayWrites[i];
         if (clausesMatchFilter(clauses, reg.clauses)) {
-            if (reg.callback(columns, clauses)) {
+            if (reg.callback(filteredColumns, clauses)) {
                 skipXylem = true;
             }
         }
@@ -1005,72 +988,89 @@ int XylemEngine::write(const Array<Clause>& columns, const Array<Clauses>& claus
         }
         
         PendingWrite pw;
-        pw.columns       = columns;
+        pw.columns       = filteredColumns;
         pw.clauses       = clauses;
         pw.encryptionKey = encryptionKey;
         journal->lockPendingWrite(txId, pw);
         
-        String payload = Journal::serializeTableWrite(columns, clauses, encryptionKey);
+        String payload = Journal::serializeTableWrite(filteredColumns, clauses, encryptionKey);
         journal->lockAppend(txId, JournalOpType::TABLE_WRITE, 0, payload);
         
         return 0;
     }
 
     if (!tableStore) return -1;
-    int result = tableStore->write(columns, clauses, encryptionKey);
+    int result = tableStore->write(filteredColumns, clauses, encryptionKey, 0, isVolatile, now);
     if (result == 0) {
         if (watcher) {
             Map<String, String> mockRow;
-            for (const auto& col : columns) {
+            for (const auto& col : filteredColumns) {
                 ParsedCol pc = parseCol(col.col);
                 mockRow.set(pc.name, col.val);
             }
             watcher->notify(mockRow);
         }
         
-        String payload = Journal::serializeTableWrite(columns, clauses, encryptionKey);
+        String payload = Journal::serializeTableWrite(filteredColumns, clauses, encryptionKey);
         journal->append(JournalOpType::TABLE_WRITE, 0, payload);
-        if (payload.size() > 4000 || journal->isNearingCapacity()) flush();
+        if (autoFlush || payload.size() > 4000 || journal->isNearingCapacity()) flush();
+    }
+    return result;
+}
+
+int XylemEngine::append(const Array<Clause>& columns, const Array<Clauses>& clauses, u64 txId, const String& encryptionKey, u64 now) {
+    // append always inserts a new row (no update path), guaranteed to match all criteria leading to it
+    // We pass empty clauses to force insert, but the original clauses are used to resolve path context
+    ensureMounted();
+    if (isWriteBlocked(txId)) return -1;
+
+    // Check for ::volatile special column
+    bool isVolatile = false;
+    Array<Clause> filteredColumns;
+    for (usz i = 0; i < columns.size(); ++i) {
+        const auto& c = columns[i];
+        ParsedCol pc = parseCol(c.col);
+        if (pc.name == "::volatile") {
+            if (c.val == "1" || c.val == "true" || c.val == "yes") isVolatile = true;
+            continue;
+        }
+        filteredColumns.push(c);
+    }
+
+    if (!tableStore) return -1;
+    // Force insert: pass empty clauses so write does an insert rather than update
+    int result = tableStore->write(filteredColumns, Array<Clauses>(), encryptionKey, txId, isVolatile, now);
+    if (result == 0) {
+        if (watcher) {
+            Map<String, String> mockRow;
+            for (const auto& col : filteredColumns) {
+                ParsedCol pc = parseCol(col.col);
+                mockRow.set(pc.name, col.val);
+            }
+            watcher->notify(mockRow);
+        }
+        String payload = Journal::serializeTableWrite(filteredColumns, Array<Clauses>(), encryptionKey);
+        if (journal) {
+            journal->append(JournalOpType::TABLE_WRITE, 0, payload);
+            if (autoFlush || payload.size() > 4000 || journal->isNearingCapacity()) flush();
+        }
     }
     return result;
 }
 
 int XylemEngine::writeVolatile(const Array<Clause>& columns, const Array<Clauses>& clauses, u64 txId, const String& encryptionKey) {
-    ensureMounted();
-    if (isWriteBlocked(txId)) return -1;
-
-    // Overlay writes
-    bool skipXylem = false;
-    for (usz i = 0; i < overlayWrites.size(); ++i) {
-        const auto& reg = overlayWrites[i];
-        if (clausesMatchFilter(clauses, reg.clauses)) {
-            if (reg.callback(columns, clauses)) {
-                skipXylem = true;
-            }
-        }
-    }
-    if (skipXylem) return 0;
-
-    if (!tableStore) return -1;
-    // Bypass journal entirely and flag as volatile
-    int result = tableStore->write(columns, clauses, encryptionKey, 0, true);
-    if (result == 0 && watcher) {
-        Map<String, String> mockRow;
-        for (const auto& col : columns) {
-            ParsedCol pc = parseCol(col.col);
-            mockRow.set(pc.name, col.val);
-        }
-        watcher->notify(mockRow);
-    }
-    flush();
-    return result;
+    // Legacy compatibility: inject ::volatile=1 column and delegate to write()
+    Array<Clause> newCols;
+    newCols.push({"::volatile", "=", "1"});
+    for (usz i = 0; i < columns.size(); ++i) newCols.push(columns[i]);
+    return write(newCols, clauses, txId, encryptionKey, 0);
 }
 
 
-bool XylemEngine::rm(const Array<Clauses>& clauses, u64 length, u64 as, bool burn) {
+bool XylemEngine::rm(const Array<Clauses>& clauses, u64 length, u64 as, bool burn, u64 now) {
     ensureMounted();
     if (isWriteBlocked(as)) return false;
-    bool ok = tableStore->rm(clauses, length, burn);
+    bool ok = tableStore->rm(clauses, length, burn, now);
     if (ok) {
         String payload = Journal::serializeTableRemove(clauses, length);
         if (as != 0) {
@@ -1272,24 +1272,24 @@ void XylemEngine::mergeUnusedDiffs() {
 // ─── Blob API ─────────────────────────────────────────────────────────────────
 
 String XylemEngine::writeHash(const String& content) {
-    String hash = Security::hash(content, 16);
-    if (blobStore) blobStore->writeHash(hash, 0, content, "");
-    return hash;
+    String hashVal = hash(content, 16);
+    if (blobStore) blobStore->writeHash(hashVal, 0, content, "");
+    return hashVal;
 }
 
-String XylemEngine::writeHash(const String& content, const String& hash) {
-    if (blobStore) blobStore->writeHash(hash, 0, content, "");
-    return hash;
+String XylemEngine::writeHash(const String& content, const String& hashVal) {
+    if (blobStore) blobStore->writeHash(hashVal, 0, content, "");
+    return hashVal;
 }
 
 String XylemEngine::writeHash(const String& content, u64 position) {
-    String hash = Security::hash(content, 16);
+    String hashVal = hash(content, 16);
     if (blobStore) {
-        if (blobStore->wouldOverlap(position, (u32)content.size())) return hash;
-        blobStore->writeHash(hash, 0, content, "");
-        fixHash(hash, position);
+        if (blobStore->wouldOverlap(position, (u32)content.size())) return hashVal;
+        blobStore->writeHash(hashVal, 0, content, "");
+        fixHash(hashVal, position);
     }
-    return hash;
+    return hashVal;
 }
 
 int XylemEngine::fixHash(const String& hash, u64 position) {
@@ -1634,25 +1634,30 @@ QueryResult XylemEngine::cat(const String& path, u64 start, u64 end) {
     
     Array<String> cols;
     cols.push("content");
+    cols.push("content:blob");
     
     Array<Clauses> queryClauses;
     queryClauses.push(WHERE("name", "path", normPath));
     
     auto rows = read(cols, queryClauses);
-    if (rows.size() > 0 && rows[0].has("content")) {
-        String content = *rows[0].get("content");
-        if (s > 0 || e > 0 || bracketPos >= 0) {
-            u64 s_idx = s;
-            u64 e_idx = (e > 0) ? e : (u64)content.size();
-            if (e_idx > (u64)content.size()) e_idx = (u64)content.size();
-            if (s_idx < e_idx) content = content.slice((usz)s_idx, (usz)e_idx);
-            else content = "";
+    for (usz i = 0; i < rows.size(); ++i) {
+        if (rows[i].has("content") || rows[i].has("content:blob")) {
+            String content = rows[i].has("content") ? *rows[i].get("content") : *rows[i].get("content:blob");
+            if (s > 0 || e > 0 || bracketPos >= 0) {
+                u64 s_idx = s;
+                u64 e_idx = (e > 0) ? e : (u64)content.size();
+                if (e_idx > (u64)content.size()) e_idx = (u64)content.size();
+                if (s_idx < e_idx) content = content.slice((usz)s_idx, (usz)e_idx);
+                else content = "";
+            }
+            Map<String, String> row;
+            row.set("content", content);
+            res.readRows.push(row);
+            res.code = 0;
+            break;
         }
-        Map<String, String> row;
-        row.set("content", content);
-        res.readRows.push(row);
-        res.code = 0;
-    } else {
+    }
+    if (res.readRows.size() == 0) {
         res.code = -1;
     }
     return res;
@@ -1685,16 +1690,21 @@ QueryResult XylemEngine::tee(const String& path, const String& content, u64 star
     
     // 1. Check if the path already exists
     Array<String> readCols;
+    readCols.push("::id");
     readCols.push("id");
     readCols.push("type");
     Array<Clauses> readClauses;
     readClauses.push(WHERE("name", "path", normPath));
     auto rows = read(readCols, readClauses);
     
-    if (rows.size() > 0 && rows[0].has("id")) {
+    String existingId;
+    if (rows.size() > 0) {
+        if (rows[0].has("::id")) existingId = *rows[0].get("::id");
+        else if (rows[0].has("id")) existingId = *rows[0].get("id");
+    }
+
+    if (!existingId.isEmpty()) {
         // Path exists. Update it.
-        String existingId = *rows[0].get("id");
-        
         Array<Clause> writeCols;
         String colName = (content.size() > 512) ? "content:blob" : "content";
         if (s > 0 || e > 0 || bracketPos >= 0) {
@@ -1703,7 +1713,7 @@ QueryResult XylemEngine::tee(const String& path, const String& content, u64 star
         writeCols.push({colName, "=", content});
         
         Array<Clauses> writeClauses;
-        writeClauses.push(WHERE("id", "=", existingId));
+        writeClauses.push(WHERE("::id", "=", existingId));
         
         res.code = write(writeCols, writeClauses);
     } else {
@@ -1715,7 +1725,7 @@ QueryResult XylemEngine::tee(const String& path, const String& content, u64 star
         }
         if (cleanParts.size() == 0) return QueryResult();
         
-        String currentParentId = "";
+        String currentParentId = "0";
         String currentPathStr = "";
         
         // Traverse down the directories and create them if missing
@@ -1727,32 +1737,31 @@ QueryResult XylemEngine::tee(const String& path, const String& content, u64 star
             dirClauses.push(WHERE("name", "path", currentPathStr));
             auto dirRows = read(readCols, dirClauses);
             
-            if (dirRows.size() > 0 && dirRows[0].has("id")) {
+            if (dirRows.size() > 0 && dirRows[0].has("::id")) {
+                currentParentId = *dirRows[0].get("::id");
+            } else if (dirRows.size() > 0 && dirRows[0].has("id")) {
                 currentParentId = *dirRows[0].get("id");
             } else {
-                u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
-                String newId(rnd);
-                
                 Array<Clause> dirCols;
                 dirCols.push({"name", "=", cleanParts[i]});
-                dirCols.push({"parent_id", "=", currentParentId});
-                dirCols.push({"id", "=", newId});
+                dirCols.push({"::parent", "=", currentParentId});
+                dirCols.push({"::id", "=", "0"});
                 dirCols.push({"type", "=", "dir"});
                 dirCols.push({"perms", "=", "755"});
                 
                 write(dirCols);
-                currentParentId = newId;
+                auto newDirRows = read(readCols, dirClauses);
+                if (newDirRows.size() > 0 && newDirRows[0].has("::id")) {
+                    currentParentId = *newDirRows[0].get("::id");
+                }
             }
         }
         
         // Create the file itself
-        u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
-        String fileId(rnd);
-        
         Array<Clause> fileCols;
         fileCols.push({"name", "=", cleanParts[cleanParts.size() - 1]});
-        fileCols.push({"parent_id", "=", currentParentId});
-        fileCols.push({"id", "=", fileId});
+        fileCols.push({"::parent", "=", currentParentId});
+        fileCols.push({"::id", "=", "0"});
         fileCols.push({"type", "=", "file"});
         fileCols.push({"perms", "=", "644"});
         
@@ -1776,15 +1785,15 @@ QueryResult XylemEngine::ls(const String& path) {
     }
     
     Array<String> cols;
-    cols.push("id");
+    cols.push("::id");
     cols.push("name");
-    cols.push("parent_id");
+    cols.push("::parent");
     cols.push("type");
     cols.push("perms");
     
     Array<Clauses> queryClauses;
     if (normPath.isEmpty() || normPath == "/") {
-        queryClauses.push(WHERE("parent_id", "empty", ""));
+        queryClauses.push(WHERE("::parent", "=", "0"));
     } else {
         String queryPath = normPath;
         if (!queryPath.startsWith("/")) {
@@ -1827,12 +1836,15 @@ QueryResult XylemEngine::cp(const String& src, const String& dst) {
     if (cleanDst.endsWith("/") && cleanDst.size() > 1) cleanDst = cleanDst.slice(0, cleanDst.size() - 1);
 
     Array<String> cols;
+    cols.push("::id");
     cols.push("id");
     cols.push("name");
+    cols.push("::parent");
     cols.push("parent_id");
     cols.push("type");
     cols.push("perms");
     cols.push("content");
+    cols.push("content:blob");
 
     Array<Clauses> srcClauses;
     srcClauses.push(WHERE("name", "path", cleanSrc));
@@ -1843,19 +1855,21 @@ QueryResult XylemEngine::cp(const String& src, const String& dst) {
     const auto& srcRow = srcRows[0];
     String type = srcRow.has("type") ? *srcRow.get("type") : "file";
     String perms = srcRow.has("perms") ? *srcRow.get("perms") : "644";
-    String content = srcRow.has("content") ? *srcRow.get("content") : "";
+    String content;
+    if (srcRow.has("content")) content = *srcRow.get("content");
+    else if (srcRow.has("content:blob")) content = *srcRow.get("content:blob");
 
     if (type == "file") {
         res = tee(cleanDst, content);
         if (res.code == 0) {
-            Array<String> dstCols; dstCols.push("id");
+            Array<String> dstCols; dstCols.push("::id");
             Array<Clauses> dstClauses; dstClauses.push(WHERE("name", "path", cleanDst));
             auto dstRows = read(dstCols, dstClauses);
-            if (dstRows.size() > 0 && dstRows[0].has("id")) {
+            if (dstRows.size() > 0 && dstRows[0].has("::id")) {
                 Array<Clause> updateCols;
                 updateCols.push({"perms", "=", perms});
                 Array<Clauses> updateClauses;
-                updateClauses.push(WHERE("id", "=", *dstRows[0].get("id")));
+                updateClauses.push(WHERE("::id", "=", *dstRows[0].get("::id")));
                 write(updateCols, updateClauses);
             }
         }
@@ -1870,26 +1884,25 @@ QueryResult XylemEngine::cp(const String& src, const String& dst) {
             if (!dstParts[i].isEmpty()) cleanDstParts.push(dstParts[i]);
         }
 
-        String currentParentId = "";
+        String currentParentId = "0";
         for (usz i = 0; i < cleanDstParts.size(); ++i) {
             String currentPathStr = "";
             for (usz j = 0; j <= i; ++j) currentPathStr += "/" + cleanDstParts[j];
 
             Array<Clauses> dirClauses;
             dirClauses.push(WHERE("name", "path", currentPathStr));
-            Array<String> minCols; minCols.push("id");
+            Array<String> minCols; minCols.push("::id");
             auto dirRows = read(minCols, dirClauses);
 
-            if (dirRows.size() > 0 && dirRows[0].has("id")) {
-                currentParentId = *dirRows[0].get("id");
+            if (dirRows.size() > 0 && dirRows[0].has("::id")) {
+                currentParentId = *dirRows[0].get("::id");
             } else {
-                u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
-                String newId(rnd);
+                String newId(tableStore->claimId());
 
                 Array<Clause> dirCols;
                 dirCols.push({"name", "=", cleanDstParts[i]});
-                dirCols.push({"parent_id", "=", currentParentId});
-                dirCols.push({"id", "=", newId});
+                dirCols.push({"::parent", "=", currentParentId});
+                dirCols.push({"::id", "=", newId});
                 dirCols.push({"type", "=", "dir"});
                 dirCols.push({"perms", "=", (i == cleanDstParts.size() - 1) ? perms : "755"});
 
@@ -1899,7 +1912,7 @@ QueryResult XylemEngine::cp(const String& src, const String& dst) {
         }
 
         String dstDirId = currentParentId;
-        String srcDirId = *srcRow.get("id");
+        String srcDirId = *srcRow.get("::id");
 
         Map<String, String> srcIdToDstId;
         srcIdToDstId.set(srcDirId, dstDirId);
@@ -1911,15 +1924,14 @@ QueryResult XylemEngine::cp(const String& src, const String& dst) {
             Array<Map<String, String>> nextPending;
             for (usz i = 0; i < pending.size(); ++i) {
                 const auto& row = pending[i];
-                String pId = row.has("parent_id") ? *row.get("parent_id") : "";
+                String pId = row.has("::parent") ? *row.get("::parent") : "";
                 if (srcIdToDstId.has(pId)) {
-                    u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
-                    String newId(rnd);
+                    String newId(tableStore->claimId());
 
                     Array<Clause> fileCols;
                     fileCols.push({"name", "=", *row.get("name")});
-                    fileCols.push({"parent_id", "=", *srcIdToDstId.get(pId)});
-                    fileCols.push({"id", "=", newId});
+                    fileCols.push({"::parent", "=", *srcIdToDstId.get(pId)});
+                    fileCols.push({"::id", "=", newId});
                     fileCols.push({"type", "=", row.has("type") ? *row.get("type") : "file"});
                     fileCols.push({"perms", "=", row.has("perms") ? *row.get("perms") : "644"});
                     if (row.has("content")) {
@@ -1927,7 +1939,7 @@ QueryResult XylemEngine::cp(const String& src, const String& dst) {
                     }
 
                     write(fileCols);
-                    srcIdToDstId.set(*row.get("id"), newId);
+                    srcIdToDstId.set(*row.get("::id"), newId);
                     progress = true;
                 } else {
                     nextPending.push(row);
@@ -1952,8 +1964,10 @@ QueryResult XylemEngine::mv(const String& src, const String& dst) {
     if (cleanDst.endsWith("/") && cleanDst.size() > 1) cleanDst = cleanDst.slice(0, cleanDst.size() - 1);
 
     Array<String> cols;
+    cols.push("::id");
     cols.push("id");
     cols.push("name");
+    cols.push("::parent");
     cols.push("parent_id");
     
     Array<Clauses> srcClauses;
@@ -1962,7 +1976,9 @@ QueryResult XylemEngine::mv(const String& src, const String& dst) {
 
     if (srcRows.size() == 0) return res;
 
-    String srcId = *srcRows[0].get("id");
+    String srcId;
+    if (srcRows[0].has("::id")) srcId = *srcRows[0].get("::id");
+    else if (srcRows[0].has("id")) srcId = *srcRows[0].get("id");
 
     Array<String> dstParts = cleanDst.split("/");
     Array<String> cleanDstParts;
@@ -1973,26 +1989,25 @@ QueryResult XylemEngine::mv(const String& src, const String& dst) {
 
     String dstName = cleanDstParts[cleanDstParts.size() - 1];
 
-    String currentParentId = "";
+    String currentParentId = "0";
     for (usz i = 0; i < cleanDstParts.size() - 1; ++i) {
         String currentPathStr = "";
         for (usz j = 0; j <= i; ++j) currentPathStr += "/" + cleanDstParts[j];
 
         Array<Clauses> dirClauses;
         dirClauses.push(WHERE("name", "path", currentPathStr));
-        Array<String> minCols; minCols.push("id");
+        Array<String> minCols; minCols.push("::id");
         auto dirRows = read(minCols, dirClauses);
 
-        if (dirRows.size() > 0 && dirRows[0].has("id")) {
-            currentParentId = *dirRows[0].get("id");
+        if (dirRows.size() > 0 && dirRows[0].has("::id")) {
+            currentParentId = *dirRows[0].get("::id");
         } else {
-            u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
-            String newId(rnd);
+            String newId(tableStore->claimId());
 
             Array<Clause> dirCols;
             dirCols.push({"name", "=", cleanDstParts[i]});
-            dirCols.push({"parent_id", "=", currentParentId});
-            dirCols.push({"id", "=", newId});
+            dirCols.push({"::parent", "=", currentParentId});
+            dirCols.push({"::id", "=", newId});
             dirCols.push({"type", "=", "dir"});
             dirCols.push({"perms", "=", "755"});
 
@@ -2003,10 +2018,10 @@ QueryResult XylemEngine::mv(const String& src, const String& dst) {
 
     Array<Clause> updateCols;
     updateCols.push({"name", "=", dstName});
-    updateCols.push({"parent_id", "=", currentParentId});
+    updateCols.push({"::parent", "=", currentParentId});
 
     Array<Clauses> updateClauses;
-    updateClauses.push(WHERE("id", "=", srcId));
+    updateClauses.push(WHERE("::id", "=", srcId));
 
     res.code = write(updateCols, updateClauses);
     flush();

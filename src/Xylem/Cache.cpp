@@ -5,7 +5,7 @@ namespace Xylem {
 Cache::Cache(BlockDevice* dev, usz maxCache) 
     : device(dev), maxCacheSize(maxCache), currentUsedBytes(0), accessCounter(0) {}
 
-InlineArray<u8> Cache::get(u32 blockIdx) {
+Array<u8> Cache::get(u32 blockIdx) {
     accessCounter++;
     if (auto* entry = entries.get(blockIdx)) {
         entry->accessSeq = accessCounter;
@@ -13,7 +13,7 @@ InlineArray<u8> Cache::get(u32 blockIdx) {
     }
 
     // Cache miss: logic hooks up to decompress device block here.
-    InlineArray<u8> data;
+    Array<u8> data;
     
     CacheEntry entry = { blockIdx, data, false, accessCounter };
     entries.set(blockIdx, entry);
@@ -26,7 +26,7 @@ InlineArray<u8> Cache::get(u32 blockIdx) {
     return data;
 }
 
-void Cache::put(u32 blockIdx, const InlineArray<u8>& data) {
+void Cache::put(u32 blockIdx, const Array<u8>& data) {
     accessCounter++;
     if (auto* pEntry = entries.get(blockIdx)) {
         CacheEntry& entry = *pEntry;

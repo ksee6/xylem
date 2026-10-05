@@ -12,6 +12,7 @@ project(Xylem VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Enable CCache
 find_program(CCACHE_PROGRAM ccache)
@@ -27,24 +28,24 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fuse-ld=mold")
 set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} -fuse-ld=mold")
 message(STATUS "mold linker enabled")
 
-# Include the local 'xic' library from the sibling directory
-get_filename_component(XIC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xic" ABSOLUTE)
-if(NOT EXISTS "${XIC_DIR}/CMakeLists.txt")
-    message(STATUS "xic not found at ${XIC_DIR}, downloading automatically...")
+# Include the local 'standard' library from the sibling directory
+get_filename_component(STANDARD_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../standard" ABSOLUTE)
+if(NOT EXISTS "${STANDARD_DIR}/CMakeLists.txt")
+    message(STATUS "standard not found at ${STANDARD_DIR}, downloading automatically...")
     execute_process(
-        COMMAND git clone https://github.com/xipid/xic.git "${XIC_DIR}"
+        COMMAND git clone https://github.com/xipid/standard.git "${STANDARD_DIR}"
         RESULT_VARIABLE CLONE_RESULT
     )
     if(NOT CLONE_RESULT EQUAL 0)
-        message(FATAL_ERROR "Failed to automatically download xic from https://github.com/xipid/xic.git")
+        message(FATAL_ERROR "Failed to automatically download standard from https://github.com/xipid/standard.git")
     endif()
 endif()
 
-if(EXISTS "${XIC_DIR}/CMakeLists.txt")
-    message(STATUS "Found xic at ${XIC_DIR}")
-    add_subdirectory(${XIC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/xic EXCLUDE_FROM_ALL)
+if(EXISTS "${STANDARD_DIR}/CMakeLists.txt")
+    message(STATUS "Found standard at ${STANDARD_DIR}")
+    add_subdirectory(${STANDARD_DIR} ${CMAKE_CURRENT_BINARY_DIR}/standard EXCLUDE_FROM_ALL)
 else()
-    message(FATAL_ERROR "xic not found at ${XIC_DIR}")
+    message(FATAL_ERROR "standard not found at ${STANDARD_DIR}")
 endif()
 
 # Include the local 'rho' library from the sibling directory
@@ -81,8 +82,8 @@ target_include_directories(Xylem PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 
-# Link against Xi and Rho
-target_link_libraries(Xylem PUBLIC Xi::Xi Rho)
+# Link against Ksee and Rho
+target_link_libraries(Xylem PUBLIC Ksee::Ksee Rho)
 
 # --- Test Discovery ---
 file(GLOB TEST_SOURCES "tests/*.cpp")

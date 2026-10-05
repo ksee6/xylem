@@ -5,9 +5,9 @@
 #include <Rho/Tunnel.hpp>
 #include <Util/Server.hpp>
 #include <Lines/Bind.hpp>
-#include <Collection/Map.hpp>
-#include <Collection/String.hpp>
-#include <Collection/Array.hpp>
+#include <Ksee/Map.hpp>
+#include <Ksee/String.hpp>
+#include <Ksee/Array.hpp>
 
 #include <mutex>
 
@@ -17,36 +17,36 @@ class XylemServer {
 public:
     XylemEngine& engine;
     Rho::Server server;
-    Collection::Map<Rho::Tunnel*, Collection::String> clientIdentities;
-    Collection::Map<Rho::Tunnel*, Collection::String> clientPubKeys;
-    std::mutex* engineMutex = nullptr;
+    Map<Rho::Tunnel*, String> clientIdentities;
+    Map<Rho::Tunnel*, String> clientPubKeys;
+    std::shared_mutex* engineMutex = nullptr;
     
     // Permission cache: avoids querying /perms/ on every request
     bool permsCacheChecked = false;
     bool permsCacheResult = false;
 
-    XylemServer(XylemEngine& eng, std::mutex* mtx = nullptr);
+    XylemServer(XylemEngine& eng, std::shared_mutex* mtx = nullptr);
     ~XylemServer();
 
     void hook(Lines::Bind& bind);
     void update();
 
     bool hasAnyPermissions();
-    bool checkPermission(const Collection::String& clientHash, const Collection::String& action, const Collection::String& path);
-    Collection::String getClientPubKey(const Collection::String& clientHash);
-    Collection::String getPathForId(const Collection::String& id);
-    Collection::String getPathForRow(const Collection::Map<Collection::String, Collection::String>& row);
-    Collection::String getPathForRowId(Xi::u64 rId);
-    Collection::String getPermPath(const Collection::String& action, const Collection::String& path);
+    bool checkPermission(const String& clientHash, const String& action, const String& path);
+    String getClientPubKey(const String& clientHash);
+    String getPathForId(const String& id);
+    String getPathForRow(const Map<String, String>& row);
+    String getPathForRowId(u64 rId);
+    String getPermPath(const String& action, const String& path);
 
 private:
     void handleCart(Rho::Cart& cart);
     void handlePacket(const Rho::Packet& p, Rho::Tunnel& tunnel);
     
     // Deconstruct paths and check permission helpers
-    bool checkReadPermForRows(const Collection::String& clientHash, Collection::Array<Collection::Map<Collection::String, Collection::String>>& rows);
-    bool checkWritePerm(const Collection::String& clientHash, const Collection::Array<Clause>& columns, const Collection::Array<Clauses>& clauses);
-    bool checkRmPerm(const Collection::String& clientHash, const Collection::Array<Clauses>& clauses);
+    bool checkReadPermForRows(const String& clientHash, Array<Map<String, String>>& rows);
+    bool checkWritePerm(const String& clientHash, const Array<Clause>& columns, const Array<Clauses>& clauses);
+    bool checkRmPerm(const String& clientHash, const Array<Clauses>& clauses);
 };
 
 } // namespace Xylem

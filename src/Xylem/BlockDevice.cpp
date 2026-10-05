@@ -10,17 +10,22 @@ u64 BlockDevice::makeNonce(u32 blockIdx, u16 eraseCount) const {
 }
 
 bool BlockDevice::eraseBlock(u32 blockIdx) {
-  if (!config.blockErase || !config.onDeviceErase) {
-    return true; // In archive mode or if no erase provided, assume
-                 // success/no-op
+  if (!config.onDeviceErase) {
+    memDisk.remove(blockIdx);
+    return true;
+  }
+  if (!config.blockErase) {
+    return true; // In archive mode, assume success/no-op
   }
   u64 offset = (u64)blockIdx * config.blockSize;
   return config.onDeviceErase(offset, offset + config.blockSize);
 }
 
 bool BlockDevice::writeBlock(u32 blockIdx, u16 eraseCount, const String &data) {
-  if (!config.onDeviceWrite)
-    return false;
+  if (!config.onDeviceWrite) {
+    memDisk.set(blockIdx, data);
+    return true;
+  }
 
   u64 offset = (u64)blockIdx * config.blockSize;
   String finalData = data;
@@ -48,8 +53,15 @@ bool BlockDevice::writeBlock(u32 blockIdx, u16 eraseCount, const String &data) {
 }
 
 String BlockDevice::readBlock(u32 blockIdx, u16 eraseCount) {
-  if (!config.onDeviceRead)
-    return String();
+  if (!config.onDeviceRead) {
+    if (memDisk.has(blockIdx)) {
+      return *memDisk.get(blockIdx);
+    }
+    String empty;
+    empty.allocate(config.blockSize);
+    empty.fill(0xFF);
+    return empty;
+  }
 
   u64 offset = (u64)blockIdx * config.blockSize;
 

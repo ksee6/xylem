@@ -1,10 +1,12 @@
 #ifndef XYLEM_XBDIFF_HPP
 #define XYLEM_XBDIFF_HPP
 
-#include <Collection/Array.hpp>
-#include <Collection/String.hpp>
+#include <Ksee/Array.hpp>
+#include <Ksee/String.hpp>
 
 namespace Xylem {
+
+using namespace Ksee;
 
 class BlobStore;
 
@@ -23,20 +25,20 @@ public:
         usz sourceOffset = 0;
         
         // For LITERAL
-        Collection::String literalData;
+        String literalData;
         
         // For HASH
-        Collection::String hash;
+        String hash;
         usz hashOffset = 0;
     };
 
-    Collection::String baseContent;
-    Collection::Array<Segment> segments;
-    Collection::Array<Collection::String> hashesInserted;
+    String baseContent;
+    Array<Segment> segments;
+    Array<String> hashesInserted;
     BlobStore* blobStore = nullptr;
 
     XBDiff();
-    explicit XBDiff(const Collection::String& baseVal);
+    explicit XBDiff(const String& baseVal);
 
     // Proxy for array-like writing: df[index] = byte
     struct ByteRef {
@@ -54,16 +56,16 @@ public:
 
     usz size() const;
 
-    void insertHash(usz index, const Collection::String& hash);
-    void set(usz position, const Collection::String& array);
-    void splice(usz start, usz deleteCount, const Collection::String& insertData = Collection::String());
+    void insertHash(usz index, const String& hash);
+    void set(usz position, const String& array);
+    void splice(usz start, usz deleteCount, const String& insertData = String());
 
-    Collection::String toBinary() const;
-    Collection::String toString() const;
-    Collection::String toBinaryContent(BlobStore* bs = nullptr) const;
+    String toBinary() const;
+    String toString() const;
+    String toBinaryContent(BlobStore* bs = nullptr) const;
 
-    static XBDiff create(const Collection::String& oldData, const Collection::String& newData);
-    static XBDiff fromBinary(const Collection::String& bin, const Collection::String& baseVal = Collection::String());
+    static XBDiff create(const String& oldData, const String& newData);
+    static XBDiff fromBinary(const String& bin, const String& baseVal = String());
 };
 
 } // namespace Xylem

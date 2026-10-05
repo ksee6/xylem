@@ -3,11 +3,11 @@
 
 #include <Xylem/Format.hpp>
 #include <Xylem/BlockDevice.hpp>
-#include <Collection/InlineArray.hpp>
+#include <Ksee/Array.hpp>
 
 namespace Xylem {
 
-using namespace Collection;
+using namespace Ksee;
 
 struct BlockMeta {
     u16 eraseCount;
@@ -32,10 +32,12 @@ struct AllocHeapEntry {
 class Allocator {
 public:
     BlockDevice* device;
-    InlineArray<BlockMeta> bam;
-    InlineArray<AllocHeapEntry> freeHeap;
+    Array<BlockMeta> bam;
+    Array<AllocHeapEntry> freeHeap;
     u32 bamStartBlock = 2;
     u32 bamBlockCount = 16;
+    u32 activeBank = 0;
+    u32 currentGeneration = 0;
 
     Allocator(BlockDevice* dev);
 

@@ -16,7 +16,7 @@ void Allocator::initFromFormat(u32 blockCount) {
 }
 
 void Allocator::buildHeap() {
-    freeHeap = InlineArray<AllocHeapEntry>();
+    freeHeap = Array<AllocHeapEntry>();
     for (u32 i = 0; i < bam.size(); ++i) {
         if (bam[i].getStatus() == BlockStatus::FREE) {
             pushHeap({bam[i].eraseCount, i});
@@ -24,18 +24,33 @@ void Allocator::buildHeap() {
     }
 }
 
-// BAM block format:
-//   [4B] count of entries in this block
+static constexpr u32 BAM_MAGIC_V2 = 0x42414D32; // "BAM2"
+
+// Dual-generation crash-consistent BAM format:
+//   [4B] magic (0x42414D32)
+//   [4B] generation (u32)
+//   [4B] blockIndex (u32)
+//   [4B] count of entries (u32)
 //   [count * 3B] entries (u16 eraseCount LE + u8 packed)
 //   [4B] CRC32 of all preceding bytes
 void Allocator::saveBam() {
     if (!device || !device->config.onDeviceWrite) return;
 
     u32 blockSize = device->config.blockSize;
-    // Overhead: 4B count + 4B CRC = 8B
-    u32 entriesPerBlock = (blockSize > 8) ? (blockSize - 8) / 3 : 1;
+    u32 entriesPerBlock = (blockSize > 20) ? (blockSize - 20) / 3 : 1;
     usz totalEntries = bam.size();
 
+    u32 targetBank = 0;
+    u32 targetStart = bamStartBlock;
+    u32 nextGen = currentGeneration + 1;
+
+    // Check if device has space for dual-bank shadow BAM
+    if (bamStartBlock + bamBlockCount * 2 <= bam.size()) {
+        targetBank = (activeBank == 0) ? 1 : 0;
+        targetStart = (targetBank == 0) ? bamStartBlock : (bamStartBlock + bamBlockCount);
+    }
+
+    bool allSuccess = true;
     for (u32 b = 0; b < bamBlockCount; ++b) {
         usz start = (usz)b * entriesPerBlock;
         if (start >= totalEntries) break;
@@ -49,7 +64,11 @@ void Allocator::saveBam() {
         u8* ptr = (u8*)data.data();
         u8* blockStart = ptr;
 
-        *(u32*)ptr = count; ptr += 4;
+        *(u32*)ptr = BAM_MAGIC_V2; ptr += 4;
+        *(u32*)ptr = nextGen;      ptr += 4;
+        *(u32*)ptr = b;            ptr += 4;
+        *(u32*)ptr = count;        ptr += 4;
+
         for (usz i = start; i < end; ++i) {
             *(u16*)ptr = bam[i].eraseCount; ptr += 2;
             *ptr++ = bam[i].packed;
@@ -60,7 +79,15 @@ void Allocator::saveBam() {
         *(u32*)ptr = c; ptr += 4;
 
         u32 blockDataLen = (u32)(ptr - blockStart);
-        device->writeBlock(bamStartBlock + b, 0, data.slice(0, blockDataLen));
+        if (!device->writeBlock(targetStart + b, 0, data.slice(0, blockDataLen))) {
+            allSuccess = false;
+            break;
+        }
+    }
+
+    if (allSuccess) {
+        activeBank = targetBank;
+        currentGeneration = nextGen;
     }
 }
 
@@ -68,8 +95,95 @@ bool Allocator::loadBam() {
     if (!device || !device->config.onDeviceRead) return false;
 
     u32 blockSize = device->config.blockSize;
-    u32 entriesPerBlock = (blockSize > 8) ? (blockSize - 8) / 3 : 1;
     usz totalEntries = bam.size();
+
+    auto tryLoadV2Bank = [&](u32 bankStart, u32& outGen) -> bool {
+        u32 entriesPerBlock = (blockSize > 20) ? (blockSize - 20) / 3 : 1;
+        u32 expectedGen = 0;
+        usz entryIdx = 0;
+
+        for (u32 b = 0; b < bamBlockCount && entryIdx < totalEntries; ++b) {
+            String data = device->readBlock(bankStart + b, 0);
+            if ((u32)data.size() < 20) return false;
+
+            const u8* blockStart = (const u8*)data.data();
+            const u8* ptr = blockStart;
+
+            u32 magic = *(const u32*)ptr; ptr += 4;
+            if (magic != BAM_MAGIC_V2) return false;
+
+            u32 gen = *(const u32*)ptr; ptr += 4;
+            if (b == 0) expectedGen = gen;
+            else if (gen != expectedGen) return false;
+
+            u32 bIdx = *(const u32*)ptr; ptr += 4;
+            if (bIdx != b) return false;
+
+            u32 count = *(const u32*)ptr; ptr += 4;
+            if (count == 0 || count > entriesPerBlock) return false;
+
+            u32 payloadLen = 16 + count * 3;
+            if (payloadLen + 4 > (u32)data.size()) return false;
+
+            u32 storedCrc   = *(const u32*)(blockStart + payloadLen);
+            u32 computedCrc = crc32(blockStart, payloadLen);
+            if (storedCrc != computedCrc) return false;
+
+            entryIdx += count;
+        }
+        outGen = expectedGen;
+        return entryIdx > 0;
+    };
+
+    auto applyV2Bank = [&](u32 bankStart) {
+        u32 entriesPerBlock = (blockSize > 20) ? (blockSize - 20) / 3 : 1;
+        usz entryIdx = 0;
+        for (u32 b = 0; b < bamBlockCount && entryIdx < totalEntries; ++b) {
+            String data = device->readBlock(bankStart + b, 0);
+            const u8* ptr = (const u8*)data.data() + 16; // Skip header
+            u32 count = *(const u32*)((const u8*)data.data() + 12);
+            for (u32 i = 0; i < count && entryIdx < totalEntries; ++i, ++entryIdx) {
+                bam[entryIdx].eraseCount = *(const u16*)ptr; ptr += 2;
+                bam[entryIdx].packed     = *ptr++;
+            }
+        }
+    };
+
+    // Try Bank 0
+    u32 gen0 = 0, gen1 = 0;
+    bool bank0Valid = tryLoadV2Bank(bamStartBlock, gen0);
+
+    // Try Bank 1 (if within bounds)
+    bool bank1Valid = false;
+    if (bamStartBlock + bamBlockCount * 2 <= totalEntries) {
+        bank1Valid = tryLoadV2Bank(bamStartBlock + bamBlockCount, gen1);
+    }
+
+    if (bank0Valid && bank1Valid) {
+        if (gen1 > gen0) {
+            applyV2Bank(bamStartBlock + bamBlockCount);
+            activeBank = 1;
+            currentGeneration = gen1;
+        } else {
+            applyV2Bank(bamStartBlock);
+            activeBank = 0;
+            currentGeneration = gen0;
+        }
+        return true;
+    } else if (bank0Valid) {
+        applyV2Bank(bamStartBlock);
+        activeBank = 0;
+        currentGeneration = gen0;
+        return true;
+    } else if (bank1Valid) {
+        applyV2Bank(bamStartBlock + bamBlockCount);
+        activeBank = 1;
+        currentGeneration = gen1;
+        return true;
+    }
+
+    // Fall back to legacy V1 format (Bank 0)
+    u32 entriesPerBlock = (blockSize > 8) ? (blockSize - 8) / 3 : 1;
     usz entryIdx = 0;
 
     for (u32 b = 0; b < bamBlockCount && entryIdx < totalEntries; ++b) {
@@ -78,22 +192,24 @@ bool Allocator::loadBam() {
 
         const u8* blockStart = (const u8*)data.data();
         const u8* ptr = blockStart;
-        u32 count = *(u32*)ptr; ptr += 4;
+        u32 count = *(const u32*)ptr; ptr += 4;
         if (count == 0 || count > entriesPerBlock) { return false; }
 
         u32 payloadLen = 4 + count * 3;
         if (payloadLen + 4 > (u32)data.size()) { return false; }
 
-        u32 storedCrc   = *(u32*)(blockStart + payloadLen);
+        u32 storedCrc   = *(const u32*)(blockStart + payloadLen);
         u32 computedCrc = crc32(blockStart, payloadLen);
         if (storedCrc != computedCrc) { return false; }
 
         for (u32 i = 0; i < count && entryIdx < totalEntries; ++i, ++entryIdx) {
-            bam[entryIdx].eraseCount = *(u16*)ptr; ptr += 2;
+            bam[entryIdx].eraseCount = *(const u16*)ptr; ptr += 2;
             bam[entryIdx].packed     = *ptr++;
         }
     }
 
+    activeBank = 0;
+    currentGeneration = 1;
     return entryIdx > 0;
 }
 

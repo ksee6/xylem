@@ -1,16 +1,17 @@
 #ifndef XYLEM_HNSW_HPP
 #define XYLEM_HNSW_HPP
 
-#include <Collection/Array.hpp>
-#include <Collection/Map.hpp>
-#include <Xi/Random.hpp>
+#include <Ksee/Array.hpp>
+#include <Ksee/Map.hpp>
+#include <Ksee/Func.hpp>
+#include <Ksee/Math/Random.hpp>
 #include <cmath>
 #include <algorithm>
 #include <queue> 
 
 namespace Xylem {
 
-using namespace Collection;
+using namespace Ksee;
 
 class HNSW {
 public:
@@ -36,11 +37,11 @@ public:
     usz currentMemoryBytes = 0;
     usz maxMemoryBytes = 1024 * 1024; // 1MB default
     
-    Xi::Func<Node*(u64)> fetchFromDisk;
-    Xi::Func<void(u64, Node*)> saveToDisk;
-    Xi::Func<void(u64)> removeFromDisk;
+    Func<HNSW::Node*(u64)> fetchFromDisk;
+    Func<void(u64, HNSW::Node*)> saveToDisk;
+    Func<void(u64)> removeFromDisk;
     
-    Map<u64, Node*> nodes;
+    Map<u64, HNSW::Node*> nodes;
     u64 entryPoint = 0;
     int maxLevel = -1;
     
@@ -105,7 +106,7 @@ public:
         }
     }
 
-    Node* fetchNode(u64 id) {
+    HNSW::Node* fetchNode(u64 id) {
         if (nodes.has(id)) {
             updateLru(id);
             return *nodes.get(id);
@@ -211,7 +212,7 @@ public:
         node->vec.allocate(dim);
         for(usz i=0; i<dim; ++i) node->vec[i] = vec[i];
         
-        int level = (int)(-std::log((f32)(Xi::randomNext() % 10000 + 1) / 10000.0f) * m_L);
+        int level = (int)(-std::log((f32)(randomNumber<u32>() % 10000 + 1) / 10000.0f) * m_L);
         node->neighbors.allocate(level + 1);
         
         nodes.set(id, node);

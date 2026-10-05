@@ -5,12 +5,12 @@
 #include <Xylem/BlockDevice.hpp>
 #include <Xylem/Allocator.hpp>
 #include <Xylem/Query.hpp>
-#include <Collection/Array.hpp>
-#include <Collection/Map.hpp>
+#include <Ksee/Array.hpp>
+#include <Ksee/Map.hpp>
 
 namespace Xylem {
 
-using namespace Collection;
+using namespace Ksee;
 
 enum class JournalOpType : u8 {
     TABLE_WRITE = 0,

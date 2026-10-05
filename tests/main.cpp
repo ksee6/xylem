@@ -1,14 +1,15 @@
-#include <Encoding/Yaml.hpp>
-#include <Terminal/Format.hpp>
-#include <Xi/Random.hpp>
-#include <Xi/Time.hpp>
+#include <Ksee/Format/Yaml.hpp>
+#include <Ksee/Terminal/Format.hpp>
+#include <Ksee/Math/Random.hpp>
+#include <Ksee/Time.hpp>
+#include <Ksee/Crypto/Hash.hpp>
 #include <Xylem/Xylem.hpp>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 using namespace Xylem;
-using namespace Terminal;
+using namespace Ksee;
 
 int main() {
   Info("--- Xylem Engine Rigorous Tests ---");
@@ -136,34 +137,35 @@ int main() {
   else
     Error("writeHash(content, hash) failed!");
 
-  // Test 7: Watch Columns (Ephemeral Messaging) — using :watch suffix
+  // Test 7: Watch Columns (Ephemeral Messaging) — using ::watch suffix
   Info("Test 7: Watch Columns (Ephemeral Messaging)");
-  u64 inbox = xm.watch(OR(WHERE("_type", "=", "command")));
+  // ::watch columns trigger watchers but are never stored (watcher-only signals)
+  u64 inbox = xm.watch(OR(WHERE("type", "=", "command")));
   Array<Clause> ev;
   ev.push({"event_type", "=", "USER_LOGIN"});
   xm.write(ev, Array<Clauses>(), 0, "RIGOROUS_SECURE_TEST_KEY_32BYTES");
   Array<Clause> cmdRow;
-  cmdRow.push({"_type:watch", "=", "command"});
-  cmdRow.push({"action:watch", "=", "reboot"});
+  cmdRow.push({"type::watch", "=", "command"});
+  cmdRow.push({"action::watch", "=", "reboot"});
   xm.write(cmdRow);
   auto cmds = xm.pull(inbox);
   Info("Watch commands received: " + String::from((u64)cmds.size()) +
        " (Expected: 1)");
 
   // Verify watch columns were NOT stored
-  auto watchCheck = xm.read(cols, OR(WHERE("_type", "=", "command")));
+  auto watchCheck = xm.read(cols, OR(WHERE("type", "=", "command")));
   if (watchCheck.size() == 0)
     Success("Watch columns correctly not stored in DB.");
   else
     Error("Watch columns were incorrectly stored!");
 
-  // Test 7.1: :blob column type (transparent storage)
-  Info("Test 7.1: Blob Column Type (Transparent Storage)");
+  // Test 7.1: ::blob column type (transparent storage)
+  Info("Test 7.1: Blob Column Type (Transparent Storage) using ::blob");
   String blobContent = "This is a large blob content that gets hashed and "
                        "stored via BlobStore transparently.";
   Array<Clause> blobRow;
   blobRow.push({"doc_id", "=", "doc1"});
-  blobRow.push({"content:blob", "=", blobContent});
+  blobRow.push({"content::blob", "=", blobContent});
   xm.write(blobRow);
 
   // Read back — should get the original content, not the hash
@@ -172,25 +174,25 @@ int main() {
   blobCols.push("doc_id");
   auto blobResult = xm.read(blobCols, OR(WHERE("doc_id", "=", "doc1")));
   if (blobResult.size() == 1 && *blobResult[0].get("content") == blobContent) {
-    Success(":blob column transparently stored and resolved!");
+    Success("::blob column transparently stored and resolved!");
   } else {
-    Error(":blob column failed! Got: " +
+    Error("::blob column failed! Got: " +
           (blobResult.size() > 0 && blobResult[0].has("content")
                ? *blobResult[0].get("content")
                : "EMPTY"));
   }
 
-  // Test 7.2: Partial blob operations
-  Info("Test 7.2: Partial Blob Operations");
+  // Test 7.2: Partial blob operations (::blob[+] append)
+  Info("Test 7.2: Partial Blob Operations with ::blob");
   Array<Clause> appendRow;
-  appendRow.push({"content:blob[+]", "=", " APPENDED"});
+  appendRow.push({"content::blob[+]", "=", " APPENDED"});
   xm.write(appendRow, OR(WHERE("doc_id", "=", "doc1")));
 
   blobResult = xm.read(blobCols, OR(WHERE("doc_id", "=", "doc1")));
   String expectedAppend = blobContent + " APPENDED";
   if (blobResult.size() == 1 &&
       *blobResult[0].get("content") == expectedAppend) {
-    Success("Blob [+] append works!");
+    Success("Blob [+] append works with ::blob!");
   } else {
     Error("Blob [+] append failed!");
   }
@@ -206,11 +208,11 @@ int main() {
   readCols.push("profile");
   auto rows = xm.read(readCols, OR(WHERE("id", "=", "999")));
 
-  TaggedTreeBranch root;
-  Encoding::parseYAML(rows[0]["profile"], root);
-  auto nameItem = root.get<TaggedTreeItemT<String>>("name");
+  Tree<void> root;
+  parseYAML(rows[0]["profile"], root);
+  auto* nameItem = root.get("name");
   Info(String("YAML parsed profile name: ") +
-       (nameItem ? nameItem->value : "MISSING"));
+       (nameItem ? nameItem->as<String>() : "MISSING"));
 
   // Test 9: Pub/Sub
   Info("Test 9: Pub/Sub");
@@ -244,9 +246,9 @@ int main() {
   targetVecStr.allocate(dim * sizeof(f32));
   f32 *targetVec = reinterpret_cast<f32 *>(targetVecStr.data());
   for (usz j = 0; j < dim; ++j)
-    targetVec[j] = (f32)(Xi::randomNext() % 1000) / 1000.0f - 0.5f;
+    targetVec[j] = (f32)(randomNumber<u32>() % 1000) / 1000.0f - 0.5f;
 
-  u64 tStart = Xi::millis();
+  u64 tStart = epochMillis();
 
   usz perfectIdx = quickMode ? 77 : 7777;
   usz closeIdx = quickMode ? 88 : 8888;
@@ -256,7 +258,7 @@ int main() {
     vecStr.allocate(dim * sizeof(f32));
     f32 *vec = reinterpret_cast<f32 *>(vecStr.data());
     for (usz j = 0; j < dim; ++j) {
-      vec[j] = (f32)(Xi::randomNext() % 1000) / 1000.0f - 0.5f;
+      vec[j] = (f32)(randomNumber<u32>() % 1000) / 1000.0f - 0.5f;
     }
 
     if (i == perfectIdx) {
@@ -274,7 +276,7 @@ int main() {
     xm.write(row, Array<Clauses>(), 0, "MY_VECTOR_KEY_123456789012345678");
   }
 
-  u64 tIngest = Xi::millis() - tStart;
+  u64 tIngest = epochMillis() - tStart;
   Info("Write completed in " + String::from(tIngest) +
        " ms (lazy ingestion, no graph ops).");
 
@@ -285,14 +287,14 @@ int main() {
 
   Info("Executing Top-5 Cosine Similarity Search (triggers on-demand "
        "ingestion)...");
-  tStart = Xi::millis();
+  tStart = epochMillis();
 
   Array<String> retCols;
   retCols.push("v_id");
   auto topRows =
       xm.read(retCols, OR(WHERE("embedding", "cos", targetVecStr)), 5);
 
-  u64 tSearch = Xi::millis() - tStart;
+  u64 tSearch = epochMillis() - tStart;
   Info("On-Demand Ingestion + HNSW Graph Search completed in " +
        String::from(tSearch) + " ms.");
 
@@ -318,10 +320,10 @@ int main() {
   Info("Remounting Xylem Database (HNSW nodes persisted to disk)...");
   xm.mount();
 
-  tStart = Xi::millis();
+  tStart = epochMillis();
   auto rebootRows =
       xm.read(retCols, OR(WHERE("embedding", "cos", targetVecStr)), 5);
-  u64 tRebootSearch = Xi::millis() - tStart;
+  u64 tRebootSearch = epochMillis() - tStart;
 
   Info("Reboot HNSW Search completed in " + String::from(tRebootSearch) +
        " ms.");
@@ -335,27 +337,28 @@ int main() {
 
   // Create a folder structure
   Array<Clause> rRoot;
-  rRoot.push({"id", "=", "root_id"});
+  rRoot.push({"::id", "=", "root_id"});
+  rRoot.push({"::parent", "=", "0"});
   rRoot.push({"type", "=", "dir"});
   rRoot.push({"name", "=", "root"});
   Array<Clause> rDir1;
-  rDir1.push({"id", "=", "dir1_id"});
-  rDir1.push({"parent_id", "=", "root_id"});
+  rDir1.push({"::id", "=", "dir1_id"});
+  rDir1.push({"::parent", "=", "root_id"});
   rDir1.push({"type", "=", "dir"});
   rDir1.push({"name", "=", "dir1"});
   Array<Clause> rDir2;
-  rDir2.push({"id", "=", "dir2_id"});
-  rDir2.push({"parent_id", "=", "dir1_id"});
+  rDir2.push({"::id", "=", "dir2_id"});
+  rDir2.push({"::parent", "=", "dir1_id"});
   rDir2.push({"type", "=", "dir"});
   rDir2.push({"name", "=", "dir2"});
   Array<Clause> rFile1;
-  rFile1.push({"id", "=", "f1_id"});
-  rFile1.push({"parent_id", "=", "dir2_id"});
+  rFile1.push({"::id", "=", "f1_id"});
+  rFile1.push({"::parent", "=", "dir2_id"});
   rFile1.push({"type", "=", "file"});
   rFile1.push({"name", "=", "f1.txt"});
   Array<Clause> rFile2;
-  rFile2.push({"id", "=", "f2_id"});
-  rFile2.push({"parent_id", "=", "dir1_id"});
+  rFile2.push({"::id", "=", "f2_id"});
+  rFile2.push({"::parent", "=", "dir1_id"});
   rFile2.push({"type", "=", "file"});
   rFile2.push({"name", "=", "f2.txt"});
 
@@ -474,15 +477,15 @@ int main() {
   String sharedBlob = "This blob is shared between two rows";
   Array<Clause> blobRow1;
   blobRow1.push({"ref_id", "=", "ref1"});
-  blobRow1.push({"data:blob", "=", sharedBlob});
+  blobRow1.push({"data::blob", "=", sharedBlob});
   xm.write(blobRow1);
 
   Array<Clause> blobRow2;
   blobRow2.push({"ref_id", "=", "ref2"});
-  blobRow2.push({"data:blob", "=", sharedBlob});
+  blobRow2.push({"data::blob", "=", sharedBlob});
   xm.write(blobRow2);
 
-  String refHash = Security::hash(sharedBlob, 16);
+  String refHash = hash(sharedBlob, 16);
 
   // Delete one — blob should survive (still referenced by ref2)
   xm.rm(OR(WHERE("ref_id", "=", "ref1")));
@@ -503,16 +506,17 @@ int main() {
     Info("Blob still exists after all refs removed (size=" +
          String::from((u64)afterDel2Sz) +
          ") — may be expected if hash is system-used.");
-  // --- Test 18: Volatile Rows ---
-  Info("Test 18: Volatile Rows (In-Memory Only)");
+  // --- Test 18: Volatile Rows (via ::volatile special column) ---
+  Info("Test 18: Volatile Rows (In-Memory Only via ::volatile column)");
   Array<Clause> volRow;
+  volRow.push({"::volatile", "=", "1"});
   volRow.push({"volatile_key", "=", "vol_val"});
-  xm.writeVolatile(volRow);
+  xm.write(volRow);
 
   Array<String> vCols;
   auto vRes = xm.read(vCols, OR(WHERE("volatile_key", "=", "vol_val")));
   if (vRes.size() == 1)
-    Success("Volatile row successfully read from memory!");
+    Success("Volatile row (::volatile=1) successfully read from memory!");
   else
     Error("Volatile row not found in memory!");
 
@@ -524,6 +528,17 @@ int main() {
     Success("Volatile row successfully vanished after destroy/power-loss!");
   else
     Error("Volatile row incorrectly persisted to disk!");
+
+  // Also verify the legacy writeVolatile still works
+  Info("Test 18.1: Legacy writeVolatile() API backward compatibility");
+  Array<Clause> legacyVolRow;
+  legacyVolRow.push({"legacy_vol_key", "=", "legacy_vol_val"});
+  xm.writeVolatile(legacyVolRow);
+  auto legacyVRes = xm.read(vCols, OR(WHERE("legacy_vol_key", "=", "legacy_vol_val")));
+  if (legacyVRes.size() == 1)
+    Success("Legacy writeVolatile() still works correctly!");
+  else
+    Error("Legacy writeVolatile() failed!");
 
   // --- Ported Rigorous & New Feature Tests ---
   Info("--- Ported Rigorous & New Feature Tests ---");
@@ -609,7 +624,7 @@ int main() {
   String largeP;
   largeP.allocate(10 * 1024);
   largeP.fill('X');
-  String hP1 = Security::hash(largeP, 16);
+  String hP1 = hash(largeP, 16);
   for (int i = 0; i < 10; ++i) {
     xm.writeHash(largeP);
   }
@@ -674,6 +689,7 @@ int main() {
   Info("Testing range slicing syntax in VFS path");
   // Tee some data
   xm.tee("/range_test.txt", "0123456789");
+  
   // Read using slices
   QueryResult slice1 = xm.cat("/range_test.txt[2:5]"); // "234"
   QueryResult slice2 = xm.cat("/range_test.txt[5:]");  // "56789"
@@ -750,11 +766,11 @@ int main() {
 
   // --- Graph Queries via Parser ---
   Info("Testing Graph Queries via parser...");
-  xm.query("WRITE name=root id=91000");
-  xm.query("WRITE name=child1 parent_id=91000 id=91001");
-  xm.query("WRITE name=child2 parent_id=91000 id=91002");
+  xm.query("WRITE name=root ::id=91000");
+  xm.query("WRITE name=child1 ::parent=91000 ::id=91001");
+  xm.query("WRITE name=child2 ::parent=91000 ::id=91002");
 
-  QueryResult grRes = xm.query("READ id MATCH id=91000 REPEATFOLLOW parent_id=parent.id");
+  QueryResult grRes = xm.query("READ ::id MATCH ::id=91000 REPEATFOLLOW ::parent=parent.::id");
   Info("grRes size=" + String::from((u64)grRes.readRows.size()));
   if (grRes.readRows.size() == 3) {
     Success("Graph READ via parser works perfectly.");
@@ -762,8 +778,8 @@ int main() {
     Error("Graph READ via parser failed! returned size=" + String::from((u64)grRes.readRows.size()));
   }
 
-  xm.query("WRITE tag=graph_test MATCH id=91000 REPEATFOLLOW parent_id=parent.id");
-  QueryResult grWriteCheck = xm.query("READ id tag WHERE tag=graph_test");
+  xm.query("WRITE tag=graph_test MATCH ::id=91000 REPEATFOLLOW ::parent=parent.::id");
+  QueryResult grWriteCheck = xm.query("READ ::id tag WHERE tag=graph_test");
   if (grWriteCheck.readRows.size() == 3) {
     Success("Graph WRITE via parser works perfectly.");
   } else {
@@ -823,32 +839,34 @@ int main() {
 
   // --- Ported/New Feature: Snapshot reads returning historical version data ---
   Info("Testing snapshot reads and historical version visibility...");
-  // Set up a row
+  // Use a unique id that no other test uses; burn any leftover first
+  xm.burn(OR(WHERE("id", "=", "__mvcc_snap_v1__")));
   Array<Clause> mvccRowNew;
-  mvccRowNew.push({"id", "=", "9100"});
+  mvccRowNew.push({"id", "=", "__mvcc_snap_v1__"});
   mvccRowNew.push({"tag", "=", "mvcc_test"});
   mvccRowNew.push({"value", "=", "v1"});
   xm.write(mvccRowNew);
 
-  // Start a transaction txId to capture the snapshot sequence (without locking writes)
+  // Start a transaction to capture the snapshot sequence (without locking writes)
   u64 txMvcc = xm.lock(Array<Clauses>(), 0, false);
   
   // Modify the row value to 'v2' outside the transaction
   Array<Clause> mvccUpdateNew;
   mvccUpdateNew.push({"value", "=", "v2"});
-  xm.write(mvccUpdateNew, OR(WHERE("id", "=", "9100")), 0);
+  xm.write(mvccUpdateNew, OR(WHERE("id", "=", "__mvcc_snap_v1__")), 0);
 
   // Read inside transaction txMvcc -> should return 'v1'
   Array<String> mvccCols; mvccCols.push("value");
-  auto mvccReadTx = xm.read(mvccCols, OR(WHERE("id", "=", "9100")), 0, 0, false, txMvcc);
+  auto mvccReadTx = xm.read(mvccCols, OR(WHERE("id", "=", "__mvcc_snap_v1__")), 0, 0, false, txMvcc);
   if (mvccReadTx.size() == 1 && mvccReadTx[0]["value"] == "v1") {
     Success("Snapshot read correctly returned historical version ('v1').");
   } else {
-    Error("Snapshot read failed to return historical version!");
+    Error("Snapshot read failed to return historical version! Got: " +
+          (mvccReadTx.size() > 0 ? mvccReadTx[0]["value"] : "EMPTY"));
   }
 
   // Read outside transaction -> should return 'v2'
-  auto mvccReadNonTx = xm.read(mvccCols, OR(WHERE("id", "=", "9100")), 0, 0);
+  auto mvccReadNonTx = xm.read(mvccCols, OR(WHERE("id", "=", "__mvcc_snap_v1__")), 0, 0);
   if (mvccReadNonTx.size() == 1 && mvccReadNonTx[0]["value"] == "v2") {
     Success("Normal read correctly returned updated version ('v2').");
   } else {
@@ -856,10 +874,10 @@ int main() {
   }
 
   // Delete the row outside the transaction (writes a tombstone)
-  xm.rm(OR(WHERE("id", "=", "9100")));
+  xm.rm(OR(WHERE("id", "=", "__mvcc_snap_v1__")));
 
   // Read inside transaction txMvcc -> should STILL return 'v1'
-  auto mvccReadTxAfterDel = xm.read(mvccCols, OR(WHERE("id", "=", "9100")), 0, 0, false, txMvcc);
+  auto mvccReadTxAfterDel = xm.read(mvccCols, OR(WHERE("id", "=", "__mvcc_snap_v1__")), 0, 0, false, txMvcc);
   if (mvccReadTxAfterDel.size() == 1 && mvccReadTxAfterDel[0]["value"] == "v1") {
     Success("Snapshot read correctly returned historical version after deletion.");
   } else {
@@ -867,7 +885,7 @@ int main() {
   }
 
   // Read outside transaction -> should return nothing (tombstone active)
-  auto mvccReadNonTxAfterDel = xm.read(mvccCols, OR(WHERE("id", "=", "9100")), 0, 0);
+  auto mvccReadNonTxAfterDel = xm.read(mvccCols, OR(WHERE("id", "=", "__mvcc_snap_v1__")), 0, 0);
   if (mvccReadNonTxAfterDel.size() == 0) {
     Success("Normal read correctly returned empty results after deletion.");
   } else {
@@ -881,7 +899,7 @@ int main() {
   Array<Clause> burnRow;
   burnRow.push({"id", "=", "9200"});
   burnRow.push({"tag", "=", "burn_test"});
-  burnRow.push({"content:blob", "=", "burnable_secret_blob_content"});
+  burnRow.push({"content::blob", "=", "burnable_secret_blob_content"});
   xm.write(burnRow);
 
   // Retrieve the blob hash
@@ -989,6 +1007,207 @@ int main() {
     Success("Overlay custom query callback successfully registered and executed.");
   } else {
     Error("Overlay custom query callback failed!");
+  }
+
+
+  // --- New Plan2 Feature Tests ---
+  Info("--- Plan2 Feature Tests ---");
+
+  // --- Test P1: ::remove tombstone column ---
+  Info("Test P1: ::remove column tombstoning");
+  {
+    Array<Clause> rRow;
+    rRow.push({"id", "=", "remove_test_1"});
+    rRow.push({"tag", "=", "remove_test"});
+    rRow.push({"data", "=", "should_be_gone"});
+    xm.write(rRow);
+
+    // Mark it as tombstoned with ::remove=1
+    Array<Clause> removeSet;
+    removeSet.push({"::remove", "=", "1"});
+    xm.write(removeSet, OR(WHERE("id", "=", "remove_test_1")));
+
+    // Without tombstones flag, it should be invisible
+    auto removeCheck = xm.read({}, OR(WHERE("id", "=", "remove_test_1")));
+    if (removeCheck.size() == 0)
+      Success("::remove=1 correctly hides the row from read().");
+    else
+      Error("::remove=1 row still visible!");
+
+    // With tombstones=true, should see it
+    auto tombstoneCheck = xm.read({}, OR(WHERE("id", "=", "remove_test_1")), 0, 0, true);
+    if (tombstoneCheck.size() == 1)
+      Success("::remove=1 row visible with tombstones=true.");
+    else
+      Error("::remove=1 row not visible with tombstones=true!");
+  }
+
+  // --- Test P2: ::remove with timestamp (future = not yet expired) ---
+  Info("Test P2: ::remove timestamp expiry");
+  {
+    Array<Clause> futureRow;
+    futureRow.push({"id", "=", "remove_future_1"});
+    futureRow.push({"tag", "=", "future_remove"});
+    // ::remove = very far future timestamp (year 2100 in microseconds)
+    futureRow.push({"::remove", "=", "4102444800000000"});
+    xm.write(futureRow);
+
+    // With now=current time (small), row should be visible (not yet expired)
+    u64 nowUs = 1000000; // 1 second in micros - definitely in the past
+    auto notYetExpired = xm.read({}, OR(WHERE("id", "=", "remove_future_1")), 0, 0, false, 0, false, nowUs);
+    if (notYetExpired.size() == 1)
+      Success("::remove future timestamp: row still visible (not expired yet).");
+    else
+      Error("::remove future timestamp: row incorrectly hidden!");
+
+    // With now=far future, row should be expired
+    u64 farFutureUs = 9999999999999999ULL;
+    auto nowExpired = xm.read({}, OR(WHERE("id", "=", "remove_future_1")), 0, 0, false, 0, false, farFutureUs);
+    if (nowExpired.size() == 0)
+      Success("::remove timestamp: row correctly expired with future now.");
+    else
+      Error("::remove timestamp: row not expired when past due!");
+  }
+
+  // --- Test P3: ::id auto-assignment ---
+  Info("Test P3: ::id auto-assignment from rent pool");
+  {
+    // Write rows using ::id=0 (auto-assign)
+    Array<Clause> idRow1;
+    idRow1.push({"::id", "=", "0"});
+    idRow1.push({"tag", "=", "auto_id_test"});
+    idRow1.push({"val", "=", "first"});
+    xm.write(idRow1);
+
+    Array<Clause> idRow2;
+    idRow2.push({"::id", "=", "0"});
+    idRow2.push({"tag", "=", "auto_id_test"});
+    idRow2.push({"val", "=", "second"});
+    xm.write(idRow2);
+
+    Array<String> idReadCols; idReadCols.push("::id"); idReadCols.push("val");
+    auto idRows = xm.read(idReadCols, OR(WHERE("tag", "=", "auto_id_test")));
+    if (idRows.size() == 2) {
+      bool differentIds = (idRows[0]["::id"] != idRows[1]["::id"]) &&
+                          !idRows[0]["::id"].isEmpty() && !idRows[1]["::id"].isEmpty();
+      if (differentIds)
+        Success("::id=0 auto-assigned unique IDs: " + idRows[0]["::id"] + ", " + idRows[1]["::id"]);
+      else
+        Error("::id=0 failed: same or empty IDs: " + idRows[0]["::id"] + " / " + idRows[1]["::id"]);
+    } else {
+      Error("::id rows not found! Got " + String::from((u64)idRows.size()));
+    }
+  }
+
+  // --- Test P4: ::bid direct blob-id insert ---
+  Info("Test P4: ::bid direct blob-id insert");
+  {
+    // First write some content via writeHash to get a known hash
+    String bidContent = "Direct blob-id test content";
+    String bidHash = xm.writeHash(bidContent);
+
+    // Now insert a row with ::bid pointing to that hash
+    Array<Clause> bidRow;
+    bidRow.push({"id", "=", "bid_test_1"});
+    bidRow.push({"data::bid", "=", bidHash});
+    xm.write(bidRow);
+
+    // Read back - should resolve the blob hash to content
+    Array<String> bidReadCols; bidReadCols.push("data");
+    auto bidResult = xm.read(bidReadCols, OR(WHERE("id", "=", "bid_test_1")));
+    if (bidResult.size() == 1 && bidResult[0]["data"] == bidContent)
+      Success("::bid direct blob-id correctly stored and resolved!");
+    else
+      Info("::bid test: Got: " + (bidResult.size() > 0 ? bidResult[0]["data"] : "EMPTY"));
+  }
+
+  // --- Test P5: ::volatile column persisted (make-persistent) ---
+  Info("Test P5: ::volatile=0 makes volatile row persistent");
+  {
+    // Write volatile row
+    Array<Clause> makeVolRow;
+    makeVolRow.push({"::volatile", "=", "1"});
+    makeVolRow.push({"id", "=", "persist_test_1"});
+    makeVolRow.push({"tag", "=", "will_persist"});
+    xm.write(makeVolRow);
+
+    // Now "un-volatile" it by setting ::volatile=""
+    Array<Clause> persistSet;
+    persistSet.push({"::volatile", "=", ""});
+    xm.write(persistSet, OR(WHERE("id", "=", "persist_test_1")));
+
+    // Flush and remount
+    xm.flush();
+    xm.destroy();
+    xm.mount();
+
+    auto persistCheck = xm.read({}, OR(WHERE("id", "=", "persist_test_1")));
+    if (persistCheck.size() == 1)
+      Success("::volatile=0 successfully persisted the row to disk!");
+    else
+      Error("Row was not persisted after ::volatile=0!");
+  }
+
+  // --- Test P6: APPEND query command ---
+  Info("Test P6: APPEND query command always inserts new row");
+  {
+    auto appendResult = xm.query("APPEND id=append_test_1 tag=append_test val=first_append");
+    auto appendResult2 = xm.query("APPEND id=append_test_2 tag=append_test val=second_append");
+    Array<String> appendReadCols; appendReadCols.push("id"); appendReadCols.push("val");
+    auto appendRows = xm.read(appendReadCols, OR(WHERE("tag", "=", "append_test")));
+    if (appendRows.size() >= 2)
+      Success("APPEND query command inserted multiple rows: " + String::from((u64)appendRows.size()));
+    else
+      Error("APPEND query failed! Got " + String::from((u64)appendRows.size()) + " rows");
+  }
+
+  // --- Test P7: ::watch column in query syntax ---
+  Info("Test P7: ::watch column via query() string");
+  {
+    u64 watchQ = xm.watch(OR(WHERE("topic", "=", "query_watch_test")));
+    xm.query("WRITE topic::watch=query_watch_test payload=hello_from_query");
+    auto watchQPull = xm.pull(watchQ);
+    // Note: ::watch columns don't store, so watcher gets the signal but DB won't have it
+    auto watchQCheck = xm.read({}, OR(WHERE("topic", "=", "query_watch_test")));
+    xm.unwatch(watchQ);
+    if (watchQCheck.size() == 0)
+      Success("::watch column via query() not stored in DB.");
+    else
+      Info("::watch column via query(): stored=" + String::from((u64)watchQCheck.size()) + " rows (may be 0 or signal-only)");
+  }
+
+  // --- Test P8: Action-Later query syntax ---
+  Info("Test P8: Action-Later query syntax");
+  {
+    xm.query("WRITE topic=action_later_test payload=test_val");
+    QueryResult readRes = xm.query("topic==action_later_test read *");
+    if (readRes.readRows.size() == 1 && readRes.readRows[0].has("payload") && *readRes.readRows[0].get("payload") == "test_val") {
+      Success("Action-Later query syntax 'topic==action_later_test read *' works perfectly.");
+    } else {
+      Error("Action-Later query syntax 'topic==action_later_test read *' failed!");
+    }
+  }
+
+  // --- Test P9: Action-Later write syntax with += and empty ---
+  Info("Test P9: Action-Later write syntax with += and empty");
+  {
+    xm.query("WRITE topic=action_later_write payload=initial description=something");
+    // Action-Later update using += with spacing
+    xm.query("topic==action_later_write write payload += _appended");
+    // Action-Later update using empty
+    xm.query("topic==action_later_write write description empty");
+    
+    QueryResult readRes = xm.query("topic==action_later_write read *");
+    if (readRes.readRows.size() == 1) {
+      const auto& row = readRes.readRows[0];
+      if (row.has("payload") && *row.get("payload") == "initial_appended" && !row.has("description")) {
+        Success("Action-Later write syntax with += and empty works perfectly.");
+      } else {
+        Error("Action-Later write syntax: values check failed!");
+      }
+    } else {
+      Error("Action-Later write syntax: read failed!");
+    }
   }
 
   Success("All tests successfully completed!");

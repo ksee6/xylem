@@ -1,17 +1,15 @@
 #ifndef XYLEM_BLOBSTORE_HPP
 #define XYLEM_BLOBSTORE_HPP
 
-#include <Collection/Map.hpp>
-#include <Resource/Compression.hpp>
-#include <Xi/Func.hpp>
+#include <Ksee/Map.hpp>
+#include <Ksee/Func.hpp>
 #include <Xylem/Allocator.hpp>
 #include <Xylem/BlockDevice.hpp>
 #include <Xylem/Format.hpp>
 
 namespace Xylem {
 
-using namespace ::Xi;
-using namespace ::Collection;
+using namespace Ksee;
 
 // Blob block format (first block of a chain):
 //   [1B] blockType = BLOB (6)
@@ -70,13 +68,9 @@ public:
   // Pending freezes (for blobs not yet written) — persisted to block device
   Array<PendingFreeze> pendingFreezes;
 
-#ifdef XI_ZSTD_ENABLED
-  Resource::ZSTD zstd;
-#endif
-
   Array<String> *globalKeys;
 
-  Xi::Func<void(u64, u64)> thawCallback;
+  Func<void(u64, u64)> thawCallback;
 
   // Bloom filter: 3 hashes derived from BLAKE2b-128 (bytes 0-7, 8-15, XOR)
   // Size: 10 bits per entry, false-positive rate < 1%

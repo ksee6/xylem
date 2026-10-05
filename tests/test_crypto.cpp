@@ -1,8 +1,8 @@
 #include <Xylem/CryptItem.hpp>
-#include <Terminal/Format.hpp>
+#include <Ksee/Terminal/Format.hpp>
 
 using namespace Xylem;
-using namespace Terminal;
+using namespace Ksee;
 
 int main() {
     String key = "RIGOROUS_SECURE_TEST_KEY_32BYTES";

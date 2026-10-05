@@ -1,7 +1,10 @@
 #include <Xylem/Xylem.hpp>
 #include <Xylem/Client.hpp>
 #include <Xylem/Server.hpp>
-#include <Terminal/Format.hpp>
+#include <Ksee/Terminal/Format.hpp>
+#include <Ksee/Math/Random.hpp>
+#include <Ksee/Crypto/ECC.hpp>
+#include <Ksee/Crypto/Hash.hpp>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -9,16 +12,14 @@
 #include <signal.h>
 
 using namespace Xylem;
-using namespace Terminal;
-using namespace Xi;
-using namespace Collection;
+using namespace Ksee;
 
 int main() {
     Info("=== Xylem Network & Authorization Tests ===");
 
     // Generate KeyPairs for Client A (Admin) and Client B (User)
     Security::KeyPair keysA = Security::generateKeyPair();
-    String hashA = Security::hash(keysA.publicKey, 8);
+    String hashA = hash(keysA.publicKey, 8);
     String hexA = "";
     for (usz i = 0; i < hashA.size(); i++) {
         char buf[3];
@@ -28,7 +29,7 @@ int main() {
     Info("Client A Hash Hex: " + hexA);
 
     Security::KeyPair keysB = Security::generateKeyPair();
-    String hashB = Security::hash(keysB.publicKey, 8);
+    String hashB = hash(keysB.publicKey, 8);
     String hexB = "";
     for (usz i = 0; i < hashB.size(); i++) {
         char buf[3];
@@ -96,7 +97,7 @@ int main() {
                 if (dirRows.size() > 0 && dirRows[0].has("id")) {
                     currentParentId = *dirRows[0].get("id");
                 } else {
-                    u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
+                    u64 rnd = randomNumber<u64>();
                     String newId(rnd);
                     
                     Array<Clause> dirCols;
@@ -107,13 +108,11 @@ int main() {
                     dirCols.push({"perms", "=", "755"});
                     
                     int res = xm.write(dirCols);
-                    printf("[DEBUG addPerm dir] name=%s, parent_id=%s, id=%s, write_res=%d\n",
-                           cleanParts[i].c_str(), currentParentId.c_str(), newId.c_str(), res);
                     currentParentId = newId;
                 }
             }
             
-            u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
+            u64 rnd = randomNumber<u64>();
             String fileId(rnd);
             
             Array<Clause> fileCols;
@@ -123,8 +122,6 @@ int main() {
             fileCols.push({"owner", "=", ownerHash});
             
             int res = xm.write(fileCols);
-            printf("[DEBUG addPerm file] name=%s, parent_id=%s, id=%s, write_res=%d\n",
-                   cleanParts[cleanParts.size() - 1].c_str(), currentParentId.c_str(), fileId.c_str(), res);
         };
 
         // Client A gets full wildcard access
@@ -143,28 +140,6 @@ int main() {
         addPerm("create", "data/**", hashB);
         addPerm("read/me", "data/**", hashB);
         addPerm("watch", "data/**", hashB);
-
-        Array<String> cols; cols.push("id"); cols.push("name"); cols.push("parent_id"); cols.push("owner");
-        Array<Clauses> allCl;
-        allCl.push(WHERE("id", "reg", ".*"));
-        auto allRows = xm.read(cols, allCl, 100, 0, false, 0, true);
-        printf("[DEBUG bootstrap] Total rows = %zu\n", allRows.size());
-        for (const auto& row : allRows) {
-            String hexOwner = "";
-            if (row.has("owner")) {
-                String o = *row.get("owner");
-                for (usz i = 0; i < o.size(); i++) {
-                    char buf[3];
-                    sprintf(buf, "%02x", (unsigned char)o[i]);
-                    hexOwner += buf;
-                }
-            }
-            printf("[DEBUG bootstrap row] id=%s, name=%s, parent_id=%s, ownerHex=%s\n",
-                   row.has("id") ? row.get("id")->c_str() : "",
-                   row.has("name") ? row.get("name")->c_str() : "",
-                   row.has("parent_id") ? row.get("parent_id")->c_str() : "",
-                   hexOwner.c_str());
-        }
 
         xm.flush();
         xm.destroy();
@@ -213,15 +188,10 @@ int main() {
         XylemServer server(xm);
         server.hook(srvBind);
 
-        int loopCount = 0;
         while (true) {
             srvBind.update();
             server.update();
             usleep(1000);
-            loopCount++;
-            if (loopCount % 1000 == 0) {
-                printf("[SERVER HEARTBEAT] loops = %d, clients size = %zu\n", loopCount, server.server.clients.size());
-            }
         }
         exit(0);
     }
@@ -271,17 +241,6 @@ int main() {
     Success("Test 2 Passed: Ownership auto-registered for creator.");
 
     // ─── Test 3: Read Permissions and Filtration ────────────────────────────
-    printf("[PARENT] Connecting Client B...\n");
-    int childStatus;
-    pid_t wpid = waitpid(pid, &childStatus, WNOHANG);
-    if (wpid == 0) {
-        printf("[PARENT] Server child process is alive (pid = %d).\n", pid);
-    } else if (wpid == pid) {
-        printf("[PARENT] Server child process exited with status %d.\n", childStatus);
-    } else {
-        printf("[PARENT] waitpid returned error: %d\n", errno);
-    }
-    
     Lines::Bind cliBindB("127.0.0.1:0");
     XylemClient clientB;
     if (!clientB.connect(cliBindB, "127.0.0.1:9099", keysB)) {
@@ -445,7 +404,7 @@ int main() {
         // Alphabetically sorted columns: content, id, name, parent_id
         String msg = "content=signature protected doc;id=" + file2Id + ";name=crypto_doc;parent_id=";
         
-        String sig = Security::signX(keysA.secretKey, msg);
+        String sig = edSign(keysA.secretKey, msg);
         
         String sigHex;
         for (usz i = 0; i < sig.size(); ++i) {

@@ -2,7 +2,7 @@
 #include <Xylem/Xylem.hpp>
 #include <cstdlib>
 
-using namespace Collection;
+using namespace Ksee;
 
 namespace Xylem {
 
@@ -86,8 +86,34 @@ Array<String> QueryParser::tokenize(const String& query, const Array<String>& ar
 static Clause parseClauseStr(const String& str) {
     Clause c;
     c.op = "=";
+    
+    // Check if the query starts with "blake" prefix operator, e.g. "blake doc_id == expected_hash"
+    // which compiles to col = "blake:16:doc_id", op = "==", val = "expected_hash"
+    // Or with slice format: "blake[:8] doc_id == expected_hash" -> col = "blake:8:doc_id"
+    if (str.startsWith("blake")) {
+        long long spaceIdx = str.indexOf(" ");
+        if (spaceIdx > 0) {
+            String blakeSpec = str.slice(0, spaceIdx);
+            String rest = str.slice(spaceIdx + 1);
+            
+            // Extract bits (default 16 bytes = 128 bits)
+            u64 bits = 16;
+            if (blakeSpec.startsWith("blake[:") && blakeSpec.endsWith("]")) {
+                String bitStr = blakeSpec.slice(7, blakeSpec.size() - 1);
+                bits = (u64)strtoull((const char*)bitStr.data(), nullptr, 10);
+            }
+            
+            Clause sub = parseClauseStr(rest);
+            c.col = "blake:" + String::from(bits) + ":" + sub.col;
+            c.op = sub.op;
+            c.val = sub.val;
+            return c;
+        }
+    }
+
     // Look for operators
     Array<String> ops;
+    ops.push("==="); ops.push("!==");
     ops.push("=="); ops.push("<="); ops.push(">="); ops.push("reg"); ops.push("!=");
     ops.push("cos"); ops.push("hash"); ops.push("path"); ops.push("empty");
     ops.push("!has"); ops.push("has");
@@ -106,6 +132,7 @@ static Clause parseClauseStr(const String& str) {
     c.val = "";
     return c;
 }
+
 
 static void parseClausesFromTokens(const Array<String>& tokens, usz& idx, Array<Clauses>& queryClauses) {
     Clauses currentGroup;
@@ -239,7 +266,8 @@ static void parseClausesFromTokens(const Array<String>& tokens, usz& idx, Array<
                     isSpecialOp = true;
                 } else if (idx + 2 < tokens.size()) {
                     String op = tokens[idx+1];
-                    if (op == "==" || op == "<=" || op == ">=" || op == "reg" ||
+                    if (op == "===" || op == "!==" ||
+                        op == "==" || op == "<=" || op == ">=" || op == "reg" ||
                         op == "cos" || op == "hash" || op == "path" ||
                         op == "!has" || op == "has" ||
                         op == "=" || op == "<" || op == ">") {
@@ -252,6 +280,7 @@ static void parseClausesFromTokens(const Array<String>& tokens, usz& idx, Array<
                         isSpecialOp = true;
                     }
                 }
+
                 if (!isSpecialOp) {
                     currentGroup.push(parseClauseStr(t));
                 }
@@ -271,7 +300,7 @@ static void parseClausesFromTokens(const Array<String>& tokens, usz& idx, Array<
     }
 }
 
-QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, const Array<String>& args) {
+QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, const Array<String>& args, u64 now) {
     QueryResult res;
     Array<String> tokens = tokenize(queryStr, args);
     if (tokens.size() == 0) return res;
@@ -327,32 +356,168 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         return cmdStr;
     };
 
-    String baseCmd = baseCmdName(tokens[0]).toUpperCase();
-    BlobRange cmdRange = parseCmdRange(tokens[0]);
+    // Pre-processing query-level prefixes/modifiers:
+    // trashed/removed, decrypt, encrypt
+    bool viewTombstones = false;
+    Array<String> queryDecryptPool;
+    String queryEncryptKey;
+    
+    usz tokenIdx = 0;
+    while (tokenIdx < tokens.size()) {
+        String t = tokens[tokenIdx];
+        String tu = t.toUpperCase();
+        if (tu == "TRASHED" || tu == "REMOVED") {
+            viewTombstones = true;
+            tokenIdx++;
+        } else if (tu == "DECRYPT" && tokenIdx + 1 < tokens.size()) {
+            // decrypt base64/raw support, comma-separated keys
+            String keysList = tokens[tokenIdx + 1];
+            Array<String> keys = keysList.split(",");
+            for (usz i = 0; i < keys.size(); ++i) {
+                if (!keys[i].isEmpty()) {
+                    engine->autoDecrypt.push(keys[i]);
+                    queryDecryptPool.push(keys[i]);
+                }
+            }
+            tokenIdx += 2;
+        } else if (tu == "ENCRYPT" && tokenIdx + 1 < tokens.size()) {
+            queryEncryptKey = tokens[tokenIdx + 1];
+            tokenIdx += 2;
+        } else {
+            break;
+        }
+    }
 
-    // ─── CAT command ───
-    if (baseCmd == "CAT") {
-        if (tokens.size() < 2) { res.code = -1; return res; }
-        String path = tokens[1];
+    if (tokenIdx >= tokens.size()) return res;
+    
+    // ─── Query Token Rewriting for Action-Later syntax ───
+    String actionCmd;
+    usz cmdTokenIdx = tokens.size();
+    for (usz i = tokenIdx; i < tokens.size(); ++i) {
+        String base = baseCmdName(tokens[i]).toUpperCase();
+        if (base == "READ" || base == "READ*" || base == "WRITE" || base == "WRITEVOLATILE" || base == "APPEND" || base == "RM" || base == "BURN" ||
+            base == "CAT" || base == "TEE" || base == "LS" || base == "VACCUM" || base == "FREEZE" || base == "THAW" ||
+            base == "LOCK" || base == "UNLOCK" || base == "COMMIT" || base == "ROLLBACK" || base == "UNWATCH" || base == "PULL" || base == "WATCH") {
+            actionCmd = tokens[i];
+            cmdTokenIdx = i;
+            break;
+        }
+    }
+
+    if (cmdTokenIdx < tokens.size() && cmdTokenIdx > tokenIdx) {
+        Array<String> prefixTokens;
+        for (usz i = 0; i < tokenIdx; ++i) {
+            prefixTokens.push(tokens[i]);
+        }
         
-        Array<String> readCols;
-        readCols.push("content");
+        Array<String> clauseBeforeTokens;
+        for (usz i = tokenIdx; i < cmdTokenIdx; ++i) {
+            clauseBeforeTokens.push(tokens[i]);
+        }
+        
+        Array<String> paramTokens;
+        for (usz i = cmdTokenIdx + 1; i < tokens.size(); ++i) {
+            paramTokens.push(tokens[i]);
+        }
+        
+        Array<String> paramCols;
+        Array<String> paramMods;
+        bool inMods = false;
+        for (usz i = 0; i < paramTokens.size(); ++i) {
+            String tu = paramTokens[i].toUpperCase();
+            if (tu == "LIMIT" || tu == "PAGE") {
+                inMods = true;
+            }
+            if (inMods) {
+                paramMods.push(paramTokens[i]);
+            } else {
+                paramCols.push(paramTokens[i]);
+            }
+        }
+        
+        Array<String> newTokens;
+        for (usz i = 0; i < prefixTokens.size(); ++i) {
+            newTokens.push(prefixTokens[i]);
+        }
+        newTokens.push(actionCmd);
+        for (usz i = 0; i < paramCols.size(); ++i) {
+            newTokens.push(paramCols[i]);
+        }
+        newTokens.push("WHERE");
+        for (usz i = 0; i < clauseBeforeTokens.size(); ++i) {
+            newTokens.push(clauseBeforeTokens[i]);
+        }
+        for (usz i = 0; i < paramMods.size(); ++i) {
+            newTokens.push(paramMods[i]);
+        }
+        
+        tokens = newTokens;
+    }
+    
+    // Shift command
+    cmd = tokens[tokenIdx].toUpperCase();
+    BlobRange cmdRange = parseCmdRange(tokens[tokenIdx]);
+    String baseCmd = baseCmdName(tokens[tokenIdx]).toUpperCase();
+
+    // ─── REMOVE / TRASH command ───
+    if (baseCmd == "REMOVE" || baseCmd == "TRASH") {
+        // e.g. REMOVE (tombstone) or REMOVE <date>
+        // TRASH or TRASH <date>
+        // Finds target rows, sets ::remove or ::trash to either '1' or microsecond date
+        String expiryVal = "1";
+        usz nextIdx = tokenIdx + 1;
+        if (nextIdx < tokens.size()) {
+            String nextToken = tokens[nextIdx];
+            String nextTokenU = nextToken.toUpperCase();
+            if (nextTokenU != "WHERE" && nextTokenU != "MATCH" && nextTokenU != "ASSERT" && nextTokenU != "LIMIT" && nextTokenU != "PAGE") {
+                expiryVal = nextToken;
+                nextIdx++;
+            }
+        }
         
         Array<Clauses> queryClauses;
-        queryClauses.push(WHERE("name", "path", path));
+        parseClausesFromTokens(tokens, nextIdx, queryClauses);
         
-        usz idx = 2;
+        Array<Clause> writeCols;
+        Clause c;
+        c.col = (baseCmd == "REMOVE") ? "::remove" : "::trash";
+        c.op = "=";
+        c.val = expiryVal;
+        writeCols.push(c);
+        
+        res.code = engine->write(writeCols, queryClauses, 0, queryEncryptKey, now);
+        return res;
+    }
+    if (baseCmd == "CAT") {
+        String path = tokens[tokenIdx + 1];
+        String cleanPath = path;
+        long long bracketPos = -1;
+        for (usz i = 0; i < path.size(); ++i) {
+            if (path[i] == '[') { bracketPos = (long long)i; break; }
+        }
+        if (bracketPos >= 0) {
+            cleanPath = path.slice(0, bracketPos);
+        }
+
+        Array<String> readCols;
+        readCols.push("content");
+
+        Array<Clauses> queryClauses;
+        queryClauses.push(WHERE("name", "path", cleanPath));
+        
+        usz idx = tokenIdx + 2;
         parseClausesFromTokens(tokens, idx, queryClauses);
         
         u64 limitVal = 0;
         u64 pageVal = 0;
-        for (usz i = 2; i < tokens.size(); ++i) {
+        for (usz i = tokenIdx + 2; i < tokens.size(); ++i) {
             String tu = tokens[i].toUpperCase();
             if (tu == "LIMIT" && i + 1 < tokens.size()) limitVal = (u64)strtoull((const char*)tokens[i+1].data(), nullptr, 0);
             if (tu == "PAGE" && i + 1 < tokens.size()) pageVal = (u64)strtoull((const char*)tokens[i+1].data(), nullptr, 0);
         }
         
-        auto rows = engine->read(readCols, queryClauses, limitVal, pageVal);
+        auto rows = engine->read(readCols, queryClauses, limitVal, pageVal, viewTombstones, 0, false, now);
+
         if (rows.size() > 0 && rows[0].has("content")) {
             String content = *rows[0].get("content");
             u64 s = cmdRange.valid ? cmdRange.start : 0;
@@ -389,17 +554,17 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
 
     // ─── TEE command ───
     if (baseCmd == "TEE") {
-        if (tokens.size() < 3) { res.code = -1; return res; }
-        String path = tokens[1];
-        String content = tokens[2];
+        if (tokens.size() <= tokenIdx + 2) { res.code = -1; return res; }
+        String path = tokens[tokenIdx + 1];
+        String content = tokens[tokenIdx + 2];
         
         Array<Clauses> queryClauses;
-        usz idx = 3;
+        usz idx = tokenIdx + 3;
         parseClausesFromTokens(tokens, idx, queryClauses);
         
         if (queryClauses.size() > 0) {
-            Array<String> idCols; idCols.push("id");
-            auto checkRows = engine->read(idCols, queryClauses);
+            Array<String> idCols; idCols.push("::id");
+            auto checkRows = engine->read(idCols, queryClauses, 0, 0, viewTombstones, 0, false, now);
             if (checkRows.size() == 0) {
                 res.code = -1;
                 return res;
@@ -414,8 +579,8 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
 
     // ─── LS command ───
     if (baseCmd == "LS") {
-        String path = tokens.size() >= 2 ? tokens[1] : "";
-        if (path.toUpperCase() == "WHERE" || path.toUpperCase() == "ASSERT" || path.toUpperCase() == "LIMIT" || path.toUpperCase() == "PAGE") {
+        String path = tokens.size() >= tokenIdx + 2 ? tokens[tokenIdx + 1] : "";
+        if (path.toUpperCase() == "WHERE" || path.toUpperCase() == "MATCH" || path.toUpperCase() == "ASSERT" || path.toUpperCase() == "LIMIT" || path.toUpperCase() == "PAGE") {
             path = "";
         }
         
@@ -425,15 +590,15 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         }
         
         Array<String> cols;
-        cols.push("id");
+        cols.push("::id");
         cols.push("name");
-        cols.push("parent_id");
+        cols.push("::parent");
         cols.push("type");
         cols.push("perms");
         
         Array<Clauses> queryClauses;
         if (cleanPath.isEmpty() || cleanPath == "/") {
-            queryClauses.push(WHERE("parent_id", "empty", ""));
+            queryClauses.push(WHERE("::parent", "=", "0"));
         } else {
             String queryPath = cleanPath;
             if (!queryPath.startsWith("/")) {
@@ -443,7 +608,7 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
             queryClauses.push(WHERE("name", "path", queryPath));
         }
         
-        usz idx = (path.isEmpty() ? 1 : 2);
+        usz idx = (path.isEmpty() ? tokenIdx + 1 : tokenIdx + 2);
         parseClausesFromTokens(tokens, idx, queryClauses);
         
         u64 limitVal = 0;
@@ -454,18 +619,18 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
             if (tu == "PAGE" && i + 1 < tokens.size()) pageVal = (u64)strtoull((const char*)tokens[i+1].data(), nullptr, 0);
         }
         
-        res.readRows = engine->read(cols, queryClauses, limitVal, pageVal);
+        res.readRows = engine->read(cols, queryClauses, limitVal, pageVal, viewTombstones, 0, false, now);
         res.code = (int)res.readRows.size();
         return res;
     }
 
     // ─── RM/BURN command ───
     if (baseCmd == "RM" || baseCmd == "BURN") {
-        if (tokens.size() < 2) { res.code = -1; return res; }
-        String firstArg = tokens[1];
+        if (tokens.size() <= tokenIdx + 1) { res.code = -1; return res; }
+        String firstArg = tokens[tokenIdx + 1];
         
         Array<Clauses> queryClauses;
-        usz idx = 2;
+        usz idx = tokenIdx + 2;
         if (firstArg.startsWith("/") || firstArg.startsWith("./") || firstArg == ".") {
             String normPath = firstArg;
             if (normPath.endsWith("/") && normPath.size() > 1) {
@@ -473,27 +638,27 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
             }
             queryClauses.push(WHERE("name", "path", normPath + "/**"));
         } else {
-            idx = 1;
+            idx = tokenIdx + 1;
         }
         
         parseClausesFromTokens(tokens, idx, queryClauses);
-        res.code = engine->rm(queryClauses, 0, 0, baseCmd == "BURN") ? 0 : -1;
+        res.code = engine->rm(queryClauses, 0, 0, baseCmd == "BURN", now) ? 0 : -1;
         return res;
     }
 
     // ─── CP command ───
     if (baseCmd == "CP") {
-        if (tokens.size() < 3) { res.code = -1; return res; }
-        String src = tokens[1];
-        String dst = tokens[2];
+        if (tokens.size() <= tokenIdx + 2) { res.code = -1; return res; }
+        String src = tokens[tokenIdx + 1];
+        String dst = tokens[tokenIdx + 2];
         
         Array<Clauses> queryClauses;
-        usz idx = 3;
+        usz idx = tokenIdx + 3;
         parseClausesFromTokens(tokens, idx, queryClauses);
         
         if (queryClauses.size() > 0) {
-            Array<String> idCols; idCols.push("id");
-            auto checkRows = engine->read(idCols, queryClauses);
+            Array<String> idCols; idCols.push("::id");
+            auto checkRows = engine->read(idCols, queryClauses, 0, 0, viewTombstones, 0, false, now);
             if (checkRows.size() == 0) {
                 res.code = -1;
                 return res;
@@ -506,17 +671,17 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
 
     // ─── MV command ───
     if (baseCmd == "MV") {
-        if (tokens.size() < 3) { res.code = -1; return res; }
-        String src = tokens[1];
-        String dst = tokens[2];
+        if (tokens.size() <= tokenIdx + 2) { res.code = -1; return res; }
+        String src = tokens[tokenIdx + 1];
+        String dst = tokens[tokenIdx + 2];
         
         Array<Clauses> queryClauses;
-        usz idx = 3;
+        usz idx = tokenIdx + 3;
         parseClausesFromTokens(tokens, idx, queryClauses);
         
         if (queryClauses.size() > 0) {
-            Array<String> idCols; idCols.push("id");
-            auto checkRows = engine->read(idCols, queryClauses);
+            Array<String> idCols; idCols.push("::id");
+            auto checkRows = engine->read(idCols, queryClauses, 0, 0, viewTombstones, 0, false, now);
             if (checkRows.size() == 0) {
                 res.code = -1;
                 return res;
@@ -526,6 +691,7 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         res = engine->mv(src, dst);
         return res;
     }
+
 
     // ─── VACCUM command ───
     if (baseCmd == "VACCUM") {
@@ -557,7 +723,7 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         parseClausesFromTokens(tokens, idx, queryClauses);
         
         Array<String> readCols;
-        readCols.push("id");
+        readCols.push("::id");
         readCols.push("content:blob");
         Array<Map<String, String>> rows = engine->read(readCols, queryClauses);
         u64 affected = 0;
@@ -631,15 +797,15 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         return res;
     }
 
-    // Standard CRUD (READ, WRITE, WRITEVOLATILE, RM, BURN)
+    // Standard CRUD (READ, WRITE, WRITEVOLATILE, APPEND, RM, BURN)
     bool isRead = (cmd == "READ" || cmd == "READ*");
-    if (isRead || cmd == "WRITE" || cmd == "WRITEVOLATILE" || cmd == "RM" || cmd == "BURN") {
+    if (isRead || cmd == "WRITE" || cmd == "WRITEVOLATILE" || cmd == "APPEND" || cmd == "RM" || cmd == "BURN") {
         bool readAllColumns = (cmd == "READ*");
         Array<String> columns;
         Array<Clause> writeCols;
         Array<Clauses> queryClauses;
 
-        usz idx = 1;
+        usz idx = tokenIdx + 1;
         while (idx < tokens.size()) {
             String t = tokens[idx];
             String tu = t.toUpperCase();
@@ -660,6 +826,31 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
                         writeCols.push(c);
                         idx += 2;
                         isThreeToken = true;
+                    } else if (op == "+=") {
+                        Clause c;
+                        String col = tokens[idx];
+                        if (col.endsWith("]")) {
+                            c.col = col.substring(0, col.size() - 1) + "+]";
+                        } else {
+                            c.col = col + "[+]";
+                        }
+                        c.op = op;
+                        c.val = tokens[idx+2];
+                        writeCols.push(c);
+                        idx += 2;
+                        isThreeToken = true;
+                    }
+                }
+                if (!isThreeToken && idx + 1 < tokens.size()) {
+                    String op = tokens[idx+1].toUpperCase();
+                    if (op == "EMPTY") {
+                        Clause c;
+                        c.col = tokens[idx];
+                        c.op = "empty";
+                        c.val = "";
+                        writeCols.push(c);
+                        idx += 1;
+                        isThreeToken = true;
                     }
                 }
                 if (!isThreeToken) {
@@ -669,7 +860,17 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
             idx++;
         }
 
-        if (cmd == "READ" && columns.size() == 0) {
+        bool hasWildcard = false;
+        for (usz i = 0; i < columns.size(); ++i) {
+            if (columns[i] == "*") {
+                hasWildcard = true;
+                columns[i] = columns[columns.size() - 1];
+                columns.pop();
+                break;
+            }
+        }
+
+        if ((cmd == "READ" || cmd == "READ*") && (columns.size() == 0 || hasWildcard)) {
             readAllColumns = true;
         }
 
@@ -689,9 +890,9 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
         }
         
         if (isRead) {
-            res.readRows = engine->read(columns, queryClauses, limitVal, pageVal, false, 0, readAllColumns);
+            res.readRows = engine->read(columns, queryClauses, limitVal, pageVal, viewTombstones, 0, readAllColumns, now);
             res.code = res.readRows.size();
-        } else if (cmd == "WRITE" || cmd == "WRITEVOLATILE") {
+        } else if (cmd == "WRITE" || cmd == "WRITEVOLATILE" || cmd == "APPEND") {
             for (usz i = 0; i < writeCols.size(); ++i) {
                 if (writeCols[i].col.endsWith(":generate")) {
                     String baseCol = writeCols[i].col.substring(0, writeCols[i].col.size() - 9);
@@ -700,18 +901,52 @@ QueryResult QueryParser::execute(XylemEngine* engine, const String& queryStr, co
                 }
             }
             if (cmd == "WRITE") {
-                res.code = engine->write(writeCols, queryClauses);
+                res.code = engine->write(writeCols, queryClauses, 0, queryEncryptKey, now);
+            } else if (cmd == "APPEND") {
+                res.code = engine->append(writeCols, queryClauses, 0, queryEncryptKey, now);
             } else {
                 res.code = engine->writeVolatile(writeCols, queryClauses);
             }
         } else if (cmd == "RM" || cmd == "BURN") {
-            res.code = engine->rm(queryClauses, 0, 0, cmd == "BURN") ? 0 : -1;
+            res.code = engine->rm(queryClauses, 0, 0, cmd == "BURN", now) ? 0 : -1;
         }
         return res;
     }
 
+
     res.code = -99; // Unknown command
     return res;
+}
+
+String QueryResult::getRowsJson() const {
+    String json = "[";
+    for (usz i = 0; i < readRows.size(); ++i) {
+        if (i > 0) json += ",";
+        json += "{";
+        bool first = true;
+        for (auto it = readRows[i].begin(); it != readRows[i].end(); ++it) {
+            if (!first) json += ",";
+            first = false;
+            
+            // Escape double quotes and backslashes in key and value
+            String escapedKey;
+            for (usz j = 0; j < it->key.length(); ++j) {
+                if (it->key[j] == '"' || it->key[j] == '\\') escapedKey.push('\\');
+                escapedKey.push(it->key[j]);
+            }
+            
+            String escapedVal;
+            for (usz j = 0; j < it->value.length(); ++j) {
+                if (it->value[j] == '"' || it->value[j] == '\\') escapedVal.push('\\');
+                escapedVal.push(it->value[j]);
+            }
+            
+            json += "\"" + escapedKey + "\":\"" + escapedVal + "\"";
+        }
+        json += "}";
+    }
+    json += "]";
+    return json;
 }
 
 } // namespace Xylem

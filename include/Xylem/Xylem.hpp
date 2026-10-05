@@ -1,6 +1,8 @@
 #ifndef XYLEM_XYLEM_HPP
 #define XYLEM_XYLEM_HPP
 
+
+
 #include <Xylem/Format.hpp>
 #include <Xylem/BlockDevice.hpp>
 #include <Xylem/Allocator.hpp>
@@ -11,14 +13,17 @@
 #include <Xylem/Watcher.hpp>
 #include <Xylem/QueryParser.hpp>
 #include <functional>
+#include <shared_mutex>
 #include <stdio.h>
 
 namespace Xylem {
 
 class XylemEngine {
 public:
+    mutable std::shared_mutex rwMutex;
     DeviceConfig config;
     usz maxCache = 1024 * 1024;
+    bool autoFlush = true; // Flush to disk after every non-transactional write (safe on append-only flash)
     void addKey(const String& key) { globalKeys.push(key); }
 
     BlockDevice* device = nullptr;
@@ -33,20 +38,29 @@ public:
     bool isMounted() const;
 
     // ─── Query Parser ────────────────────────────────────────────────────────
-    QueryResult query(const String& queryString, const Array<String>& sanitized = Array<String>());
+    QueryResult query(const String& queryString, const Array<String>& sanitized = Array<String>(), u64 now = 0);
 
     // ─── Database ────────────────────────────────────────────────────────────
     // Returns: 0 = success, >0 = ASSERT clause index, -1 = locked/error, -2 = MVCC conflict
+    // now: current time in microseconds for ::now virtual column and auto-remove of expired items.
+    //      0 means ::now returns 0 and auto-remove is disabled.
 
     Array<Map<String,String>> read(const Array<String>& columns, const Array<Clauses>& clauses,
                                     u64 length = 0, u64 page = 0, bool tombstones = false, u64 txId = 0,
-                                    bool readAllColumns = false);
+                                    bool readAllColumns = false, u64 now = 0);
     int write(const Array<Clause>& columns, const Array<Clauses>& clauses = Array<Clauses>(),
-              u64 txId = 0, const String& encryptionKey = "");
+              u64 txId = 0, const String& encryptionKey = "", u64 now = 0);
+    int append(const Array<Clause>& columns, const Array<Clauses>& clauses = Array<Clauses>(),
+               u64 txId = 0, const String& encryptionKey = "", u64 now = 0);
+    bool rm(const Array<Clauses>& clauses, u64 length = 0, u64 as = 0, bool burn = false, u64 now = 0);
+    bool burn(const Array<Clauses>& clauses, u64 length = 0, u64 as = 0) { return rm(clauses, length, as, true); }
+
+    // Legacy compatibility: writeVolatile now works by injecting ::volatile=1 column
     int writeVolatile(const Array<Clause>& columns, const Array<Clauses>& clauses = Array<Clauses>(),
                       u64 txId = 0, const String& encryptionKey = "");
-    bool rm(const Array<Clauses>& clauses, u64 length = 0, u64 as = 0, bool burn = false);
-    bool burn(const Array<Clauses>& clauses, u64 length = 0, u64 as = 0) { return rm(clauses, length, as, true); }
+
+    // Default decryption key list used regardless of per-query decrypt
+    Array<String> autoDecrypt;
 
 
     // Transactions (MVCC)
@@ -57,6 +71,8 @@ public:
     int  unlock(u64 id);
 
     String generateId(const String& column);
+    u64 claimId(); // Claim next sequential ID from the rent pool
+
 
     // ─── Blob API (ref-based) ────────────────────────────────────────────────
 

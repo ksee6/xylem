@@ -1,7 +1,10 @@
-#include <Encoding/Yaml.hpp>
-#include <Security/Crypto.hpp>
-#include <Terminal/Command.hpp>
-#include <Terminal/Format.hpp>
+#include <Ksee/Format/Yaml.hpp>
+#include <Ksee/Crypto/ECC.hpp>
+#include <Ksee/Crypto/Hash.hpp>
+#include <Ksee/Terminal/Command.hpp>
+#include <Ksee/Terminal/Format.hpp>
+#include <Ksee/Terminal/Prompt.hpp>
+#include <Ksee/Math/Random.hpp>
 #include <Xylem/Xylem.hpp>
 #include <Xylem/Client.hpp>
 #include <Xylem/Server.hpp>
@@ -13,16 +16,12 @@
 #include <unistd.h>
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
 
-using namespace Xi;
-using namespace Collection;
-using namespace Terminal;
+using namespace Ksee;
 using namespace Xylem;
 
-#include <Terminal/Prompt.hpp>
-#include <Xi/Random.hpp>
-
-std::mutex g_engineMutex;
+std::shared_mutex g_engineMutex;
 
 bool isNumericalAddressStr(const String& str) {
     if (str.startsWith("7.") || str.startsWith("8.")) return true;
@@ -96,16 +95,14 @@ String resolvePath(const String &currentDir, const String &path) {
   return finalPath.isEmpty() ? "/" : finalPath;
 }
 
-RowNode *getDeepestRowNode(TreeItem *item) {
+RowNode *getDeepestRowNode(Tree<void> *item) {
   if (!item)
     return nullptr;
   if (RowNode *rn = dynamic_cast<RowNode *>(item)) {
     return rn;
   }
-  if (TreeBranch *tb = dynamic_cast<TreeBranch *>(item)) {
-    if (tb->size() > 0) {
-      return getDeepestRowNode((*tb)[0]);
-    }
+  if (item->size() > 0) {
+    return getDeepestRowNode(item->children[0]);
   }
   return nullptr;
 }
@@ -113,7 +110,7 @@ RowNode *getDeepestRowNode(TreeItem *item) {
 template <typename T>
 String getPathId(T &xm, const String &absolutePath) {
   if (absolutePath == "/" || absolutePath.isEmpty()) {
-    return "";
+    return "0";
   }
   Array<String> parts = absolutePath.split("/");
   Array<String> cleanParts;
@@ -123,19 +120,19 @@ String getPathId(T &xm, const String &absolutePath) {
     }
   }
   if (cleanParts.size() == 0)
-    return "";
+    return "0";
 
-  String currentId = "";
+  String currentId = "0";
   for (usz i = 0; i < cleanParts.size(); ++i) {
-    String query = "READ id WHERE parent_id=%1 name=%2";
+    String query = "READ ::id WHERE ::parent=%1 name=%2";
     Array<String> args;
     args.push(currentId);
     args.push(cleanParts[i]);
     QueryResult qr = xm.query(query, args);
-    if (qr.readRows.size() == 0 || !qr.readRows[0].has("id")) {
+    if (qr.readRows.size() == 0 || !qr.readRows[0].has("::id")) {
       return ""; // Not found
     }
-    currentId = *qr.readRows[0].get("id");
+    currentId = *qr.readRows[0].get("::id");
   }
   return currentId;
 }
@@ -144,17 +141,17 @@ template <typename T>
 bool getPathRow(T &xm, const String &absolutePath,
                 Map<String, String> &outRow) {
   if (absolutePath == "/" || absolutePath.isEmpty()) {
-    outRow.set("id", "");
+    outRow.set("::id", "0");
     outRow.set("type", "dir");
     outRow.set("name", "");
-    outRow.set("parent_id", "");
+    outRow.set("::parent", "0");
     return true;
   }
   String id = getPathId(xm, absolutePath);
   if (id.isEmpty())
     return false;
 
-  String query = "READ WHERE id=%1";
+  String query = "READ WHERE ::id=%1";
   Array<String> args;
   args.push(id);
   QueryResult qr = xm.query(query, args);
@@ -166,66 +163,56 @@ bool getPathRow(T &xm, const String &absolutePath,
 
 template <typename T>
 void recursiveRemove(T &xm, const String &id) {
-  String q = "READ id WHERE parent_id=%1";
+  String q = "READ ::id WHERE ::parent=%1";
   Array<String> args;
   args.push(id);
   QueryResult qr = xm.query(q, args);
   for (usz i = 0; i < qr.readRows.size(); ++i) {
     const auto &row = qr.readRows[i];
-    if (row.has("id")) {
-      recursiveRemove(xm, *row.get("id"));
+    if (row.has("::id")) {
+      recursiveRemove(xm, *row.get("::id"));
     }
   }
-  String delQ = "RM WHERE id=%1";
+  String delQ = "RM WHERE ::id=%1";
   Array<String> delArgs;
   delArgs.push(id);
   xm.query(delQ, delArgs);
 }
 
-TreeItem *convertToYamlTree(const TreeItem *node) {
+Tree<void> *convertToYamlTree(const Tree<void> *node) {
+  if (!node) return nullptr;
   if (const RowNode *rn = dynamic_cast<const RowNode *>(node)) {
-    TaggedTreeBranch *tb = new TaggedTreeBranch();
+    Tree<void> *tb = new Tree<void>(node->path.isEmpty() ? Path("Row") : node->path);
 
-    // Ensure "id" is printed if available
-    if (rn->rId > 0 && !rn->row.has("id")) {
-      TaggedTreeItemT<String> *attrId =
-          new TaggedTreeItemT<String>(String((long long)rn->rId));
-      attrId->name = "rId";
-      tb->add(attrId);
+    // Ensure "::id" is printed if available
+    if (rn->rId > 0 && !rn->row.has("::id")) {
+      tb->push("rId", String((long long)rn->rId));
     }
 
     for (auto it = rn->row.begin(); it != rn->row.end(); ++it) {
       String val = it->value;
-      // Truncate large blobs
       if (val.size() > 256)
         val = val.slice(0, 256) + "... (truncated)";
-      TaggedTreeItemT<String> *attr = new TaggedTreeItemT<String>(val);
-      attr->name = it->key;
-      tb->add(attr);
+      tb->push(it->key, val);
     }
 
     if (rn->size() > 0) {
-      TaggedTreeArrayBranch<TreeItem> *childrenBranch =
-          new TaggedTreeArrayBranch<TreeItem>();
-      childrenBranch->setName("children");
+      Tree<void> *childrenBranch = new Tree<void>("children");
       for (usz i = 0; i < rn->size(); ++i) {
-        if ((*rn)[i])
-          childrenBranch->add(convertToYamlTree((*rn)[i]));
+        if (rn->children[i])
+          childrenBranch->addChild(convertToYamlTree(rn->children[i]));
       }
-      tb->add(childrenBranch);
+      tb->addChild(childrenBranch);
     }
     return tb;
-  } else if (const TreeBranch *branch =
-                 dynamic_cast<const TreeBranch *>(node)) {
-    TaggedTreeArrayBranch<TreeItem> *tb = new TaggedTreeArrayBranch<TreeItem>();
-    tb->setName(branch->getName());
-    for (usz i = 0; i < branch->size(); ++i) {
-      if ((*branch)[i])
-        tb->add(convertToYamlTree((*branch)[i]));
+  } else {
+    Tree<void> *tb = new Tree<void>(node->path);
+    for (usz i = 0; i < node->size(); ++i) {
+      if (node->children[i])
+        tb->addChild(convertToYamlTree(node->children[i]));
     }
     return tb;
   }
-  return node->clone();
 }
 
 String colorizeYAML(const String &yaml) {
@@ -263,28 +250,27 @@ void printResult(const QueryResult &res) {
   if (res.treeResult) {
     printf("Graph Result Node Count: %llu\n",
            (unsigned long long)res.treeResult->size());
-    TreeItem *yamlRoot = convertToYamlTree(res.treeResult);
-    printf("%s", colorizeYAML(Encoding::toYAML(*yamlRoot)).c_str());
-    delete yamlRoot;
+    Tree<void> *yamlRoot = convertToYamlTree(res.treeResult);
+    if (yamlRoot) {
+      printf("%s", colorizeYAML(toYAML(*yamlRoot)).c_str());
+      delete yamlRoot;
+    }
     delete res.treeResult;
   } else if (res.readRows.size() > 0) {
     printf("Rows Returned: %llu\n", (unsigned long long)res.readRows.size());
-    TreeBranch root;
+    Tree<void> root;
     for (usz i = 0; i < res.readRows.size() && i < 100; ++i) {
-      TaggedTreeBranch *tb = new TaggedTreeBranch();
-      tb->name = "Row";
+      Tree<void> *tb = new Tree<void>();
       const auto &row = res.readRows[i];
       for (auto it = row.begin(); it != row.end(); ++it) {
         String val = it->value;
         if (val.size() > 256)
           val = val.slice(0, 256) + "... (truncated)";
-        TaggedTreeItemT<String> *attr = new TaggedTreeItemT<String>(val);
-        attr->name = it->key;
-        tb->add(attr);
+        tb->push(it->key, val);
       }
-      root.add(tb);
+      root.addChild(tb);
     }
-    printf("%s", colorizeYAML(Encoding::toYAML(root)).c_str());
+    printf("%s", colorizeYAML(toYAML(root)).c_str());
     if (res.readRows.size() > 100)
       printf("  ... (+%llu more)\n",
              (unsigned long long)(res.readRows.size() - 100));
@@ -425,7 +411,7 @@ static String preprocessClientQuery(const String& line, XylemClient& client, con
   }
 
   // Sign using the client keys
-  String sig = Security::signX(clientKeys.secretKey, msg);
+  String sig = edSign(clientKeys.secretKey, msg);
   String sigHex = "";
   for (usz i = 0; i < sig.size(); ++i) {
     char buf[3];
@@ -433,7 +419,7 @@ static String preprocessClientQuery(const String& line, XylemClient& client, con
     sigHex += buf;
   }
 
-  String clientHash = Security::hash(clientKeys.publicKey, 8);
+  String clientHash = hash(clientKeys.publicKey, 8);
   String clientHashHex = "";
   for (usz i = 0; i < clientHash.size(); ++i) {
     char buf[3];
@@ -489,7 +475,7 @@ int main(int argc, char **argv) {
       return 1;
     }
     printf("Connected to remote Xylem database at %s.\n", dbPath.c_str());
-    String clientHash = Security::hash(clientKeys.publicKey, 8);
+    String clientHash = hash(clientKeys.publicKey, 8);
     String clientHashHex;
     for (usz i = 0; i < clientHash.size(); ++i) {
       char buf[3];
@@ -562,14 +548,14 @@ int main(int argc, char **argv) {
   Array<String> commandHistory;
 
   while (true) {
-    line = Terminal::Prompt::readLine("> ", &commandHistory);
+    line = readLine("> ", &commandHistory);
     if (line == "\x04" || line == "\x03")
       break;
 
     if (line.isEmpty())
       continue;
 
-    std::unique_lock<std::mutex> lock(g_engineMutex);
+    std::unique_lock<std::shared_mutex> lock(g_engineMutex);
 
     String uLine = line.toUpperCase();
     if (uLine == "EXIT" || uLine == "QUIT")
@@ -607,33 +593,33 @@ int main(int argc, char **argv) {
               if (!parts[i].isEmpty())
                 cleanParts.push(parts[i]);
 
-            String currentParentId = "";
+            String currentParentId = "0";
             for (usz i = 0; i < cleanParts.size(); ++i) {
-              String partName = cleanParts[i];
-              String q = "READ id WHERE name=%1 parent_id=%2";
-              Array<String> a;
-              a.push(partName);
-              a.push(currentParentId);
-              QueryResult r = isClient ? client.query(q, a) : xm.query(q, a);
+                String partName = cleanParts[i];
+                String q = "READ ::id WHERE name=%1 ::parent=%2";
+                Array<String> a;
+                a.push(partName);
+                a.push(currentParentId);
+                QueryResult r = isClient ? client.query(q, a) : xm.query(q, a);
 
-              if (r.readRows.size() > 0 && r.readRows[0].has("id")) {
-                currentParentId = *r.readRows[0].get("id");
-              } else {
-                u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
-                String newId(rnd);
-                String wq =
-                    "WRITE name=%1 parent_id=%2 id=%3 type=dir perms=755";
-                Array<String> wa;
-                wa.push(partName);
-                wa.push(currentParentId);
-                wa.push(newId);
-                if (isClient) {
-                  client.query(wq, wa);
+                if (r.readRows.size() > 0 && r.readRows[0].has("::id")) {
+                    currentParentId = *r.readRows[0].get("::id");
                 } else {
-                  xm.query(wq, wa);
+                    u64 rnd = randomNumber<u64>();
+                    String newId(rnd);
+                    String wq =
+                        "WRITE name=%1 ::parent=%2 ::id=%3 type=dir perms=755";
+                    Array<String> wa;
+                    wa.push(partName);
+                    wa.push(currentParentId);
+                    wa.push(newId);
+                    if (isClient) {
+                        client.query(wq, wa);
+                    } else {
+                        xm.query(wq, wa);
+                    }
+                    currentParentId = newId;
                 }
-                currentParentId = newId;
-              }
             }
             pwd = targetPath;
           }
@@ -704,18 +690,9 @@ int main(int argc, char **argv) {
       auto doQuery = [&](const String &q, const Array<String> &a = Array<String>()) {
         return isClient ? client.query(q, a) : xm.query(q, a);
       };
-      auto doWrite = [&](const Array<Clause> &cols, const Array<Clauses> &cls = Array<Clauses>(), u64 tx = 0) {
-        return isClient ? client.write(cols, cls, tx) : xm.write(cols, cls, tx);
+      auto doWrite = [&](const Array<Clause> &cols, const Array<Clauses> &cls = Array<Clauses>()) {
+        return isClient ? client.write(cols, cls, 0) : xm.write(cols, cls, 0);
       };
-      auto doLock = [&](u64 tx) {
-        return isClient ? client.lock(Array<Clauses>(), tx, false) : xm.lock(Array<Clauses>(), tx, false);
-      };
-      auto doUnlock = [&](u64 tx) {
-        return isClient ? client.unlock(tx) : xm.unlock(tx);
-      };
-
-      u64 txId = doLock(0);
-      int txCount = 0;
 
       auto uploadFile = [&](const String &srcPath, const String &dstPath) {
         std::ifstream file((const char *)srcPath.data(),
@@ -738,7 +715,7 @@ int main(int argc, char **argv) {
           if (cleanParts.size() == 0)
             return;
 
-          String currentParentId = "";
+          String currentParentId = "0";
           String currentPathStr = "/";
 
           // Create directory structure if missing (using cache)
@@ -749,44 +726,38 @@ int main(int argc, char **argv) {
             if (dirCache.has(currentPathStr)) {
               currentParentId = *dirCache.get(currentPathStr);
             } else {
-              String q = "READ id WHERE name=%1 parent_id=%2";
+              String q = "READ ::id WHERE name=%1 ::parent=%2";
               Array<String> a;
               a.push(partName);
               a.push(currentParentId);
               QueryResult r = doQuery(q, a);
 
-              if (r.readRows.size() > 0 && r.readRows[0].has("id")) {
-                currentParentId = *r.readRows[0].get("id");
+              if (r.readRows.size() > 0 && r.readRows[0].has("::id")) {
+                currentParentId = *r.readRows[0].get("::id");
               } else {
-                u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
-                String newId(rnd);
+                // Claim ID from rent pool (local) or auto-assign (client)
+                String newId;
+                if (!isClient) {
+                    newId = String(xm.claimId());
+                } else {
+                    newId = "0"; // auto-assigned server-side
+                }
                 Array<Clause> writeCols;
-                Clause c1;
-                c1.col = "name";
-                c1.op = "=";
-                c1.val = partName;
-                Clause c2;
-                c2.col = "parent_id";
-                c2.op = "=";
-                c2.val = currentParentId;
-                Clause c3;
-                c3.col = "id";
-                c3.op = "=";
-                c3.val = newId;
-                Clause c4;
-                c4.col = "type";
-                c4.op = "=";
-                c4.val = "dir";
-                Clause c5;
-                c5.col = "perms";
-                c5.op = "=";
-                c5.val = "755";
-                writeCols.push(c1);
-                writeCols.push(c2);
-                writeCols.push(c3);
-                writeCols.push(c4);
-                writeCols.push(c5);
-                doWrite(writeCols, Array<Clauses>(), txId);
+                Clause c1; c1.col = "name"; c1.op = "="; c1.val = partName;
+                Clause c2; c2.col = "::parent"; c2.op = "="; c2.val = currentParentId;
+                Clause c3; c3.col = "::id"; c3.op = "="; c3.val = newId;
+                Clause c4; c4.col = "type"; c4.op = "="; c4.val = "dir";
+                Clause c5; c5.col = "perms"; c5.op = "="; c5.val = "755";
+                writeCols.push(c1); writeCols.push(c2); writeCols.push(c3);
+                writeCols.push(c4); writeCols.push(c5);
+                doWrite(writeCols);
+                if (isClient) {
+                    // Re-query to get the server-assigned ::id
+                    QueryResult r2 = doQuery(q, a);
+                    if (r2.readRows.size() > 0 && r2.readRows[0].has("::id")) {
+                        newId = *r2.readRows[0].get("::id");
+                    }
+                }
                 currentParentId = newId;
                 newDirs.push(currentPathStr);
               }
@@ -795,7 +766,7 @@ int main(int argc, char **argv) {
           }
 
           String fileName = cleanParts[cleanParts.size() - 1];
-          String fileIdQuery = "READ id WHERE name=%1 parent_id=%2";
+          String fileIdQuery = "READ ::id WHERE name=%1 ::parent=%2";
           Array<String> fa;
           fa.push(fileName);
           fa.push(currentParentId);
@@ -803,9 +774,9 @@ int main(int argc, char **argv) {
 
           bool fileFound = false;
           String fileId;
-          if (rFile.readRows.size() > 0 && rFile.readRows[0].has("id")) {
+          if (rFile.readRows.size() > 0 && rFile.readRows[0].has("::id")) {
             fileFound = true;
-            fileId = *rFile.readRows[0].get("id");
+            fileId = *rFile.readRows[0].get("::id");
           }
 
           String colName = (content.size() > 512) ? "content:blob" : "content";
@@ -821,16 +792,16 @@ int main(int argc, char **argv) {
             Array<Clauses> queryClauses;
             Clauses group;
             Clause cId;
-            cId.col = "id";
+            cId.col = "::id";
             cId.op = "=";
             cId.val = fileId;
             group.push(cId);
             queryClauses.push(group);
 
-            doWrite(writeCols, queryClauses, txId);
+            doWrite(writeCols, queryClauses);
           } else {
-            u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
-            fileId = String(rnd);
+            // Claim ID from rent pool (local) or let server auto-assign (client)
+            fileId = !isClient ? String(xm.claimId()) : String("0");
 
             Array<Clause> writeCols;
             Clause c1;
@@ -839,12 +810,12 @@ int main(int argc, char **argv) {
             c1.val = fileName;
             writeCols.push(c1);
             Clause c2;
-            c2.col = "parent_id";
+            c2.col = "::parent";
             c2.op = "=";
             c2.val = currentParentId;
             writeCols.push(c2);
             Clause c3;
-            c3.col = "id";
+            c3.col = "::id";
             c3.op = "=";
             c3.val = fileId;
             writeCols.push(c3);
@@ -864,14 +835,7 @@ int main(int argc, char **argv) {
             c6.val = "644";
             writeCols.push(c6);
 
-            doWrite(writeCols, Array<Clauses>(), txId);
-          }
-
-          txCount++;
-          if (txCount >= 50) {
-            doUnlock(txId);
-            txId = doLock(0);
-            txCount = 0;
+            doWrite(writeCols);
           }
 
           progress.addLinearTaskDelta(taskIdx, size, "Importing " + fileName);
@@ -904,11 +868,6 @@ int main(int argc, char **argv) {
                linuxPath.data());
       }
 
-      if (txCount > 0)
-        doUnlock(txId);
-      if (!isClient)
-        xm.flush();
-
       progress.destroy();
       Terminal::Success("Import complete: " + String::from((long long)totalFiles) + " files (" + String::from((long long)totalBytes) + " bytes) successfully imported.");
       continue;
@@ -929,8 +888,8 @@ int main(int argc, char **argv) {
         // 1. Put all rows in a map by ID
         Map<String, const Map<String, String>*> rowMap;
         for (usz i = 0; i < res.readRows.size(); ++i) {
-          if (res.readRows[i].has("id")) {
-            rowMap.set(*res.readRows[i].get("id"), &res.readRows[i]);
+          if (res.readRows[i].has("::id")) {
+            rowMap.set(*res.readRows[i].get("::id"), &res.readRows[i]);
           }
         }
 
@@ -959,7 +918,7 @@ int main(int argc, char **argv) {
           const auto& row = res.readRows[i];
           String type = row.has("type") ? *row.get("type") : "";
           String name = row.has("name") ? *row.get("name") : "";
-          String id = row.has("id") ? *row.get("id") : "";
+          String id = row.has("::id") ? *row.get("::id") : "";
           
           // Walk up to find destination path
           Array<String> pathSegs;
@@ -967,8 +926,8 @@ int main(int argc, char **argv) {
           bool isRootFile = false;
           
           while (curr) {
-            String pId = curr->has("parent_id") ? *curr->get("parent_id") : "";
-            if (!rowMap.has(pId)) {
+            String pId = curr->has("::parent") ? *curr->get("::parent") : "";
+            if (pId == "0" || !rowMap.has(pId)) {
               // curr is a root node
               String currType = curr->has("type") ? *curr->get("type") : "";
               if (currType == "file") {

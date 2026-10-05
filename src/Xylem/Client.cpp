@@ -1,11 +1,11 @@
 #include <Xylem/Client.hpp>
-#include <Encoding/Yaml.hpp>
-#include <Security/Crypto.hpp>
+#include <Ksee/Format/Yaml.hpp>
+#include <Ksee/Crypto/ECC.hpp>
 #include <unistd.h>
 
 namespace Xylem {
 
-using namespace Collection;
+using namespace Ksee;
 using namespace Rho;
 
 XylemClient::XylemClient() {}
@@ -29,9 +29,9 @@ bool XylemClient::connect(Lines::Bind& b, const Resource::NumericalAddress& addr
     printf("[CLIENT] sending probe...\n");
     client.probe();
     
-    u64 start = Xi::millis();
+    u64 start = millis();
     int iter = 0;
-    while (!announced && Xi::millis() - start < 5000) {
+    while (!announced && millis() - start < 5000) {
         bind->update();
         client.update();
         usleep(1000);
@@ -40,7 +40,7 @@ bool XylemClient::connect(Lines::Bind& b, const Resource::NumericalAddress& addr
             client.probe();
         }
         if (iter % 1000 == 0) {
-            printf("[CLIENT] loop tick, elapsed = %llu ms\n", (unsigned long long)(Xi::millis() - start));
+            printf("[CLIENT] loop tick, elapsed = %llu ms\n", (unsigned long long)(millis() - start));
         }
     }
     
@@ -65,8 +65,8 @@ bool XylemClient::connect(Lines::Bind& b, const String& addressStr, const Securi
     });
     client.probe();
     
-    u64 start = Xi::millis();
-    while (!announced && Xi::millis() - start < 5000) {
+    u64 start = millis();
+    while (!announced && millis() - start < 5000) {
         bind->update();
         client.update();
         usleep(1000);
@@ -107,8 +107,8 @@ Map<String, String> XylemClient::sendRequest(const Map<String, String>& req) {
     client.push(Packet(req.serialize()));
     client.pushCart();
     
-    u64 start = Xi::millis();
-    while (!gotResponse && Xi::millis() - start < 10000) {
+    u64 start = millis();
+    while (!gotResponse && millis() - start < 10000) {
         bind->update();
         client.update();
         if (client.tunnel && client.tunnel->isDestroyed) {
@@ -190,8 +190,8 @@ QueryResult XylemClient::query(const String& queryString, const Array<String>& s
     }
     
     if (resp.has("treeResult")) {
-        TreeBranch* tb = new TreeBranch();
-        if (Encoding::parseYAML(*resp.get("treeResult"), *tb)) {
+        Tree<void>* tb = new Tree<void>();
+        if (parseYAML(*resp.get("treeResult"), *tb)) {
             qres.treeResult = tb;
         } else {
             delete tb;

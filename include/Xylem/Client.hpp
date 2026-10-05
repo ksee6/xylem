@@ -5,9 +5,9 @@
 #include <Rho/Tunnel.hpp>
 #include <Util/Client.hpp>
 #include <Lines/Bind.hpp>
-#include <Collection/Map.hpp>
-#include <Collection/String.hpp>
-#include <Collection/Array.hpp>
+#include <Ksee/Map.hpp>
+#include <Ksee/String.hpp>
+#include <Ksee/Array.hpp>
 
 namespace Xylem {
 
@@ -21,58 +21,58 @@ public:
     ~XylemClient();
 
     bool connect(Lines::Bind& b, const Resource::NumericalAddress& address, const Security::KeyPair& staticKeyPair);
-    bool connect(Lines::Bind& b, const Collection::String& addressStr, const Security::KeyPair& staticKeyPair);
+    bool connect(Lines::Bind& b, const String& addressStr, const Security::KeyPair& staticKeyPair);
     bool connect(Lines::Bind& b, const char* addressStr, const Security::KeyPair& staticKeyPair);
 
     bool isMounted() const;
     void update();
 
     // ─── Query Parser ────────────────────────────────────────────────────────
-    QueryResult query(const Collection::String& queryString, const Collection::Array<Collection::String>& sanitized = Collection::Array<Collection::String>());
+    QueryResult query(const String& queryString, const Array<String>& sanitized = Array<String>());
 
     // ─── Database ────────────────────────────────────────────────────────────
-    Collection::Array<Collection::Map<Collection::String,Collection::String>> read(
-        const Collection::Array<Collection::String>& columns,
-        const Collection::Array<Clauses>& clauses,
+    Array<Map<String,String>> read(
+        const Array<String>& columns,
+        const Array<Clauses>& clauses,
         u64 length = 0, u64 page = 0, bool tombstones = false, u64 txId = 0,
         bool readAllColumns = false);
 
-    int write(const Collection::Array<Clause>& columns,
-              const Collection::Array<Clauses>& clauses = Collection::Array<Clauses>(),
-              u64 txId = 0, const Collection::String& encryptionKey = "");
+    int write(const Array<Clause>& columns,
+              const Array<Clauses>& clauses = Array<Clauses>(),
+              u64 txId = 0, const String& encryptionKey = "");
 
-    int writeVolatile(const Collection::Array<Clause>& columns,
-                      const Collection::Array<Clauses>& clauses = Collection::Array<Clauses>(),
-                      u64 txId = 0, const Collection::String& encryptionKey = "");
+    int writeVolatile(const Array<Clause>& columns,
+                      const Array<Clauses>& clauses = Array<Clauses>(),
+                      u64 txId = 0, const String& encryptionKey = "");
 
-    bool rm(const Collection::Array<Clauses>& clauses, u64 length = 0, u64 as = 0);
+    bool rm(const Array<Clauses>& clauses, u64 length = 0, u64 as = 0);
 
     // Transactions (MVCC)
-    u64 lock(const Collection::Array<Clauses>& clauses = Collection::Array<Clauses>(), u64 id = 0, bool requiresExplicitAs = true);
-    u64 commit(const Collection::Array<Clauses>& clauses = Collection::Array<Clauses>(), u64 id = 0);
+    u64 lock(const Array<Clauses>& clauses = Array<Clauses>(), u64 id = 0, bool requiresExplicitAs = true);
+    u64 commit(const Array<Clauses>& clauses = Array<Clauses>(), u64 id = 0);
     bool rollback(u64 id);
     int unlock(u64 id);
 
-    Collection::String generateId(const Collection::String& column);
+    String generateId(const String& column);
 
     // File-like convenience API
-    QueryResult cat(const Collection::String& path, u64 start = 0, u64 end = 0);
-    QueryResult tee(const Collection::String& path, const Collection::String& content, u64 start = 0, u64 end = 0);
-    QueryResult ls(const Collection::String& path = "");
-    bool rm(const Collection::String& path);
-    QueryResult cp(const Collection::String& src, const Collection::String& dst);
-    QueryResult mv(const Collection::String& src, const Collection::String& dst);
+    QueryResult cat(const String& path, u64 start = 0, u64 end = 0);
+    QueryResult tee(const String& path, const String& content, u64 start = 0, u64 end = 0);
+    QueryResult ls(const String& path = "");
+    bool rm(const String& path);
+    QueryResult cp(const String& src, const String& dst);
+    QueryResult mv(const String& src, const String& dst);
 
     // Reactivity
-    u64 watch(const Collection::Array<Clauses>& clauses);
+    u64 watch(const Array<Clauses>& clauses);
     bool unwatch(u64 id);
-    Collection::Array<Collection::Map<Collection::String,Collection::String>> pull(u64 id);
+    Array<Map<String,String>> pull(u64 id);
 
 private:
-    Collection::Map<Collection::String, Collection::String> sendRequest(const Collection::Map<Collection::String, Collection::String>& req);
+    Map<String, String> sendRequest(const Map<String, String>& req);
     
-    Collection::String serializeClauses(const Collection::Array<Clauses>& clauses);
-    Collection::String serializeClauseArray(const Collection::Array<Clause>& columns);
+    String serializeClauses(const Array<Clauses>& clauses);
+    String serializeClauseArray(const Array<Clause>& columns);
 };
 
 } // namespace Xylem

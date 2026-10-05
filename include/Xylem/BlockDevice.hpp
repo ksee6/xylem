@@ -1,14 +1,13 @@
 #ifndef XYLEM_BLOCKDEVICE_HPP
 #define XYLEM_BLOCKDEVICE_HPP
 
-#include <Security/Crypto.hpp>
-#include <Xi/Func.hpp>
+#include <Ksee/Map.hpp>
+#include <Ksee/Func.hpp>
 #include <Xylem/Format.hpp>
 
 namespace Xylem {
 
-using namespace ::Xi;
-using namespace ::Collection;
+using namespace Ksee;
 
 struct DeviceConfig {
   u64 deviceSize = 0;
@@ -42,6 +41,7 @@ public:
 
 private:
   u64 makeNonce(u32 blockIdx, u16 eraseCount) const;
+  Map<u32, String> memDisk;
 };
 
 } // namespace Xylem

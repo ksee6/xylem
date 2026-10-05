@@ -1,7 +1,7 @@
 #include <Xylem/XBDiff.hpp>
 #include <Xylem/BlobStore.hpp>
 
-using namespace Collection;
+using namespace Ksee;
 
 namespace Xylem {
 

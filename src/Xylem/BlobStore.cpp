@@ -1,6 +1,7 @@
 #include <Xylem/BlobStore.hpp>
 #include <Xylem/CryptItem.hpp>
 #include <Xylem/XBDiff.hpp>
+#include <Ksee/Crypto/Hash.hpp>
 
 namespace Xylem {
 
@@ -223,7 +224,7 @@ bool BlobStore::writeHashInternal(const String& hash, u64 /*minOffset*/, const S
     }
 
     // Allocate all blocks upfront
-    InlineArray<u32> blockIdxs;
+    Array<u32> blockIdxs;
     blockIdxs.allocate(numBlocks);
     for (u32 i = 0; i < numBlocks; ++i) {
         u32 bIdx = allocator->allocBlock(BlockType::BLOB);
@@ -378,7 +379,7 @@ bool BlobStore::writeDiffHash(const String& hash, const String& baseHash, const 
         numBlocks += (remaining + cCap - 1) / cCap;
     }
 
-    InlineArray<u32> blockIdxs;
+    Array<u32> blockIdxs;
     blockIdxs.allocate(numBlocks);
     for (u32 i = 0; i < numBlocks; ++i) {
         u32 bIdx = allocator->allocBlock(BlockType::BLOB);
@@ -853,7 +854,7 @@ String BlobStore::setBlob(u32 ref) {
     auto* oldHash = refToHash.get(ref);
     if (!oldHash) return String();
     String data = readHash(*oldHash, 0, 0xFFFFFFFF);
-    String newHash = Security::hash(data, 16);
+    String newHash = hash(data, 16);
     if (newHash != *oldHash) {
         removeHash(*oldHash);
         writeHash(newHash, 0, data, "");

@@ -4,13 +4,12 @@
 #include <Xylem/Format.hpp>
 #include <Xylem/Query.hpp>
 #include <Xylem/TableStore.hpp>
-#include <Collection/Map.hpp>
-#include <Xi/Func.hpp>
+#include <Ksee/Map.hpp>
+#include <Ksee/Func.hpp>
 
 namespace Xylem {
 
-using namespace Collection;
-using namespace Xi;
+using namespace Ksee;
 
 struct WatchEntry {
     Array<Clauses> clauses;

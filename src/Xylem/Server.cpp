@@ -1,15 +1,15 @@
 #include <Xylem/Server.hpp>
 #include <Xylem/QueryParser.hpp>
-#include <Encoding/Yaml.hpp>
+#include <Ksee/Format/Yaml.hpp>
 #include <cstdio>
-#include <unistd.h>
+#include <shared_mutex>
 
 namespace Xylem {
 
-using namespace Collection;
+using namespace Ksee;
 using namespace Rho;
 
-XylemServer::XylemServer(XylemEngine& eng, std::mutex* mtx) : engine(eng), engineMutex(mtx) {}
+XylemServer::XylemServer(XylemEngine& eng, std::shared_mutex* mtx) : engine(eng), engineMutex(mtx) {}
 
 bool XylemServer::hasAnyPermissions() {
     if (permsCacheChecked) return permsCacheResult;
@@ -30,18 +30,18 @@ void XylemServer::hook(Lines::Bind& bind) {
     server.hook(bind);
     
     server.onUpgrade([this](Packet firstPkt, Tunnel& tunnel, Cart cart) {
-        std::unique_lock<std::mutex> lockVal;
-        if (engineMutex) lockVal = std::unique_lock<std::mutex>(*engineMutex);
+        std::unique_lock<std::shared_mutex> lockVal;
+        if (engineMutex) lockVal = std::unique_lock<std::shared_mutex>(*engineMutex);
         
-        // printf("[SERVER] Client upgraded, tunnel=%p\n", &tunnel);
         String clientPubKey;
         String clientHash;
-        
-        if (const String* proofed = cart.meta.get(Meta::Proofed)) {
-            Array<String> keys = Security::parseProofed(*proofed, tunnel.ephemeralKeypair.secretKey);
+        const String* proofed = cart.meta.get(Meta::Proofed);
+        Array<String> keys;
+        if (proofed) {
+            keys = Security::parseProofed(*proofed, tunnel.ephemeralKeypair.secretKey);
             if (keys.size() > 0) {
                 clientPubKey = keys[0];
-                clientHash = Security::hash(clientPubKey, 8);
+                clientHash = hash(clientPubKey, 8);
             }
         }
         
@@ -54,14 +54,31 @@ void XylemServer::hook(Lines::Bind& bind) {
     });
 
     server.onPacket([this](Packet p, Tunnel& tunnel, Cart cart) {
-        std::unique_lock<std::mutex> lockVal;
-        if (engineMutex) lockVal = std::unique_lock<std::mutex>(*engineMutex);
-        handlePacket(p, tunnel);
+        bool isReadOnly = false;
+        Map<String, String> req = Map<String, String>::deserialize(p.payload);
+        if (req.has("_cmd") && *req.get("_cmd") == "query" && req.has("query")) {
+            Array<String> tokens = QueryParser::tokenize(*req.get("query"), Array<String>());
+            if (tokens.size() > 0) {
+                String baseCmd = tokens[0].toUpperCase();
+                if (baseCmd == "READ" || baseCmd == "READ*" || baseCmd == "LS" || baseCmd == "CAT") {
+                    isReadOnly = true;
+                }
+            }
+        }
+        if (isReadOnly) {
+            std::shared_lock<std::shared_mutex> readLock;
+            if (engineMutex) readLock = std::shared_lock<std::shared_mutex>(*engineMutex);
+            handlePacket(p, tunnel);
+        } else {
+            std::unique_lock<std::shared_mutex> writeLock;
+            if (engineMutex) writeLock = std::unique_lock<std::shared_mutex>(*engineMutex);
+            handlePacket(p, tunnel);
+        }
     });
 
     server.onDisconnect([this](Map<u64, String> reason, Tunnel& tunnel, Cart cart) {
-        std::unique_lock<std::mutex> lockVal;
-        if (engineMutex) lockVal = std::unique_lock<std::mutex>(*engineMutex);
+        std::unique_lock<std::shared_mutex> lockVal;
+        if (engineMutex) lockVal = std::unique_lock<std::shared_mutex>(*engineMutex);
         clientIdentities.remove(&tunnel);
         clientPubKeys.remove(&tunnel);
     });
@@ -85,27 +102,26 @@ static void writeHierarchical(XylemEngine& engine, const String& path, const Map
     }
     if (cleanParts.size() == 0) return;
     
-    String currentParentId = "";
+    String currentParentId = "0";
     String currentPathStr = "";
     
-    Array<String> readCols; readCols.push("id");
+    Array<String> readCols; readCols.push("::id");
     
     // Traverse down the directories and create them if missing
     for (usz i = 0; i < cleanParts.size() - 1; ++i) {
         Array<Clauses> dirClauses;
-        dirClauses.push(WHERE("name", "=", cleanParts[i]) && WHERE("parent_id", "=", currentParentId));
+        dirClauses.push(WHERE("name", "=", cleanParts[i]) && WHERE("::parent", "=", currentParentId));
         auto dirRows = engine.read(readCols, dirClauses);
         
-        if (dirRows.size() > 0 && dirRows[0].has("id")) {
-            currentParentId = *dirRows[0].get("id");
+        if (dirRows.size() > 0 && dirRows[0].has("::id")) {
+            currentParentId = *dirRows[0].get("::id");
         } else {
-            u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
-            String newId(rnd);
+            String newId(engine.claimId());
             
             Array<Clause> dirCols;
             dirCols.push({"name", "=", cleanParts[i]});
-            dirCols.push({"parent_id", "=", currentParentId});
-            dirCols.push({"id", "=", newId});
+            dirCols.push({"::parent", "=", currentParentId});
+            dirCols.push({"::id", "=", newId});
             dirCols.push({"type", "=", "dir"});
             dirCols.push({"perms", "=", "755"});
             
@@ -115,13 +131,12 @@ static void writeHierarchical(XylemEngine& engine, const String& path, const Map
     }
     
     // Write the leaf item
-    u64 rnd = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
-    String fileId(rnd);
+    String fileId(engine.claimId());
     
     Array<Clause> fileCols;
     fileCols.push({"name", "=", cleanParts[cleanParts.size() - 1]});
-    fileCols.push({"parent_id", "=", currentParentId});
-    fileCols.push({"id", "=", fileId});
+    fileCols.push({"::parent", "=", currentParentId});
+    fileCols.push({"::id", "=", fileId});
     
     for (auto it = extraCols.begin(); it != extraCols.end(); ++it) {
         fileCols.push({it->key, "=", it->value});
@@ -143,7 +158,7 @@ bool XylemServer::checkPermission(const String& clientHash, const String& action
     
     String permPath = getPermPath(action, path);
     
-    Array<String> cols; cols.push("id");
+    Array<String> cols; cols.push("::id"); cols.push("id"); cols.push("owner");
     Array<Clauses> clauses;
     clauses.push(WHERE("name", "path", permPath) && WHERE("owner", "=", clientHash));
     
@@ -152,18 +167,18 @@ bool XylemServer::checkPermission(const String& clientHash, const String& action
 }
 
 String XylemServer::getPathForId(const String& id) {
-    if (id.isEmpty()) return "/";
+    if (id.isEmpty() || id == "0") return "/";
     
-    Array<String> cols; cols.push("name"); cols.push("parent_id");
-    Array<Clauses> clauses; clauses.push(WHERE("id", "=", id));
+    Array<String> cols; cols.push("name"); cols.push("::parent");
+    Array<Clauses> clauses; clauses.push(WHERE("::id", "=", id));
     
     auto rows = engine.read(cols, clauses, 1);
     if (rows.size() == 0) return "";
     
     String name = rows[0].has("name") ? *rows[0].get("name") : "";
-    String pId = rows[0].has("parent_id") ? *rows[0].get("parent_id") : "";
+    String pId = rows[0].has("::parent") ? *rows[0].get("::parent") : "";
     
-    if (pId.isEmpty()) {
+    if (pId.isEmpty() || pId == "0") {
         return "/" + name;
     }
     
@@ -174,8 +189,8 @@ String XylemServer::getPathForId(const String& id) {
 
 String XylemServer::getPathForRow(const Map<String, String>& row) {
     String name = row.has("name") ? *row.get("name") : "";
-    String pId = row.has("parent_id") ? *row.get("parent_id") : "";
-    if (pId.isEmpty()) {
+    String pId = row.has("::parent") ? *row.get("::parent") : "";
+    if (pId.isEmpty() || pId == "0") {
         return "/" + name;
     }
     String parentPath = getPathForId(pId);
@@ -302,7 +317,7 @@ bool XylemServer::checkWritePerm(const String& clientHash, const Array<Clause>& 
         String serialized = serializeRowForSigning(columns);
         String binarySig = hexToBin(owningSigHex);
         
-        if (!Security::verifyX(clientPubKey, serialized, binarySig)) {
+        if (!edVerify(clientPubKey, serialized, binarySig)) {
             return false;
         }
     }
@@ -316,7 +331,7 @@ bool XylemServer::checkWritePerm(const String& clientHash, const Array<Clause>& 
         String pId;
         for (const auto& col : columns) {
             if (col.col == "name") name = col.val;
-            if (col.col == "parent_id") pId = col.val;
+            if (col.col == "::parent" || col.col == "parent_id") pId = col.val;
         }
         
         String parentPath = getPathForId(pId);
@@ -354,12 +369,22 @@ bool XylemServer::checkWritePerm(const String& clientHash, const Array<Clause>& 
     } else {
         // MODIFY operation
         if (!engine.isMounted()) return false;
+        bool queryTargetsPerms = false;
+        for (const auto& group : clauses) {
+            for (const auto& c : group) {
+                if (c.val.startsWith("/perms") || c.val.startsWith("perms")) {
+                    queryTargetsPerms = true;
+                    break;
+                }
+            }
+        }
         Array<u64> matchedIds = engine.tableStore->getMatchingRowIds(clauses, engine.tableStore->currentSeq, 0);
         for (usz i = 0; i < matchedIds.size(); ++i) {
             String filePath = getPathForRowId(matchedIds[i]);
             if (filePath.isEmpty()) continue;
             
             if (filePath.startsWith("/perms/")) {
+                if (!queryTargetsPerms) continue;
                 if (filePath.startsWith("/perms/owning/")) {
                     return false; // Direct modification to owning perms is forbidden
                 }
@@ -391,12 +416,22 @@ bool XylemServer::checkRmPerm(const String& clientHash, const Array<Clauses>& cl
     if (!hasAnyPermissions()) return true;
     
     if (!engine.isMounted()) return false;
+    bool queryTargetsPerms = false;
+    for (const auto& group : clauses) {
+        for (const auto& c : group) {
+            if (c.val.startsWith("/perms") || c.val.startsWith("perms")) {
+                queryTargetsPerms = true;
+                break;
+            }
+        }
+    }
     Array<u64> matchedIds = engine.tableStore->getMatchingRowIds(clauses, engine.tableStore->currentSeq, 0);
     for (usz i = 0; i < matchedIds.size(); ++i) {
         String filePath = getPathForRowId(matchedIds[i]);
         if (filePath.isEmpty()) continue;
         
         if (filePath.startsWith("/perms/")) {
+            if (!queryTargetsPerms) continue;
             if (filePath.startsWith("/perms/owning/")) {
                 // This is a disown operation
                 // We must query the row to see the owner hash
@@ -416,6 +451,7 @@ bool XylemServer::checkRmPerm(const String& clientHash, const Array<Clauses>& cl
                 // Must have rm permission on the perm path
                 if (!checkPermission(clientHash, "unlink/*", filePath) && !checkPermission(clientHash, "rm/*", filePath)) return false;
             }
+        } else {
             Map<String, String>* row = engine.tableStore->fetchRow(matchedIds[i]);
             bool isOwner = false;
             if (row) {
@@ -438,14 +474,14 @@ bool XylemServer::checkRmPerm(const String& clientHash, const Array<Clauses>& cl
 
 // ─── Request Handler ─────────────────────────────────────────────────────────
 
-static void filterTreeRecursive(const String& clientHash, XylemServer* srv, TreeBranch* branch) {
+static void filterTreeRecursive(const String& clientHash, XylemServer* srv, Tree<void>* branch) {
     if (!branch) return;
     // If no permissions exist, skip filtering
     if (!srv->hasAnyPermissions()) return;
     
-    Array<TreeItem*> filtered;
+    Array<Tree<void>*> filtered;
     for (usz i = 0; i < branch->size(); ++i) {
-        TreeItem* child = (*branch)[i];
+        Tree<void>* child = branch->children[i];
         if (RowNode* rn = dynamic_cast<RowNode*>(child)) {
             String path = srv->getPathForRow(rn->row);
             bool isOwner = srv->checkPermission(clientHash, "owning", path);
@@ -457,16 +493,14 @@ static void filterTreeRecursive(const String& clientHash, XylemServer* srv, Tree
             } else {
                 delete child;
             }
-        } else if (TreeBranch* tb = dynamic_cast<TreeBranch*>(child)) {
-            filtered.push(child);
-            filterTreeRecursive(clientHash, srv, tb);
         } else {
             filtered.push(child);
+            filterTreeRecursive(clientHash, srv, child);
         }
     }
     branch->clear();
     for (usz i = 0; i < filtered.size(); ++i) {
-        branch->add(filtered[i]);
+        branch->addChild(filtered[i]);
     }
 }
 
@@ -488,32 +522,19 @@ void XylemServer::handlePacket(const Packet& p, Tunnel& tunnel) {
     
     if (cmd == "query") {
         String queryStr = req.has("query") ? *req.get("query") : "";
-        printf("[SERVER] query received: '%s'\n", queryStr.c_str());
         Array<String> tokens = QueryParser::tokenize(queryStr, Array<String>());
         if (tokens.size() > 0) {
             String baseCmd = tokens[0].toUpperCase();
             bool isRead = (baseCmd == "READ" || baseCmd == "READ*" || baseCmd == "LS" || baseCmd == "CAT");
-            printf("[SERVER] baseCmd: %s, isRead: %d\n", baseCmd.c_str(), isRead);
             
             if (isRead) {
                 QueryResult qres = engine.query(queryStr);
-                printf("[SERVER] qres.code: %d, readRows.size(): %d\n", qres.code, (int)qres.readRows.size());
                 if (qres.code >= 0) {
-                    String clientHashHex;
-                    for (usz i = 0; i < clientHash.size(); ++i) {
-                        char buf[3];
-                        sprintf(buf, "%02x", (unsigned char)clientHash[i]);
-                        clientHashHex += buf;
-                    }
-                    printf("[SERVER] clientHashHex: '%s' (size %d), hasAnyPerms: %d\n", 
-                           clientHashHex.c_str(), (int)clientHash.size(), (int)hasAnyPermissions());
-                    
                     checkReadPermForRows(clientHash, qres.readRows);
-                    printf("[SERVER] after checkReadPermForRows, readRows.size(): %d\n", (int)qres.readRows.size());
                     
                     if (qres.treeResult) {
                         filterTreeRecursive(clientHash, this, qres.treeResult);
-                        resp.set("treeResult", Encoding::toYAML(*qres.treeResult));
+                        resp.set("treeResult", toYAML(*qres.treeResult));
                         delete qres.treeResult;
                     }
                     resp.set("_status", "ok");
@@ -587,7 +608,7 @@ void XylemServer::handlePacket(const Packet& p, Tunnel& tunnel) {
                             String pId;
                             for (const auto& col : writeCols) {
                                 if (col.col == "name") name = col.val;
-                                if (col.col == "parent_id") pId = col.val;
+                                if (col.col == "::parent") pId = col.val;
                             }
                             String parentPath = getPathForId(pId);
                             String targetPath = parentPath == "/" ? "/" + name : parentPath + "/" + name;
@@ -755,7 +776,7 @@ void XylemServer::handlePacket(const Packet& p, Tunnel& tunnel) {
                     isPermInsert = true;
                     Map<String, String> extra;
                     for (const auto& col : columns) {
-                        if (col.col != "name" && col.col != "parent_id" && col.col != "id") {
+                        if (col.col != "name" && col.col != "::parent" && col.col != "::id") {
                             extra.set(col.col, col.val);
                         }
                     }
@@ -765,7 +786,29 @@ void XylemServer::handlePacket(const Packet& p, Tunnel& tunnel) {
             }
             if (!isPermInsert) {
                 if (cmd == "write") {
-                    code = engine.write(columns, clauses, txId);
+                    bool queryTargetsPerms = false;
+                    for (const auto& group : clauses) {
+                        for (const auto& c : group) {
+                            if (c.val.startsWith("/perms") || c.val.startsWith("perms")) {
+                                queryTargetsPerms = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (clauses.size() > 0 && !queryTargetsPerms) {
+                        Array<u64> matchedIds = engine.tableStore->getMatchingRowIds(clauses, engine.tableStore->currentSeq, txId);
+                        code = 0;
+                        for (u64 rid : matchedIds) {
+                            String fp = getPathForRowId(rid);
+                            if (fp.startsWith("/perms/")) continue;
+                            Array<Clauses> singleRowClause;
+                            singleRowClause.push(WHERE("::id", "=", String::from(rid)));
+                            int res = engine.write(columns, singleRowClause, txId);
+                            if (res != 0) code = res;
+                        }
+                    } else {
+                        code = engine.write(columns, clauses, txId);
+                    }
                 } else {
                     code = engine.writeVolatile(columns, clauses, txId);
                 }
@@ -781,7 +824,7 @@ void XylemServer::handlePacket(const Packet& p, Tunnel& tunnel) {
                     String pId;
                     for (const auto& col : columns) {
                         if (col.col == "name") name = col.val;
-                        if (col.col == "parent_id") pId = col.val;
+                        if (col.col == "::parent") pId = col.val;
                     }
                     String parentPath = getPathForId(pId);
                     String targetPath = parentPath == "/" ? "/" + name : parentPath + "/" + name;
@@ -840,7 +883,30 @@ void XylemServer::handlePacket(const Packet& p, Tunnel& tunnel) {
         u64 as = req.has("as") ? (u64)strtoull(req.get("as")->c_str(), nullptr, 0) : 0;
         
         if (checkRmPerm(clientHash, clauses)) {
-            bool ok = engine.rm(clauses, length, as);
+            bool ok = false;
+            bool queryTargetsPerms = false;
+            for (const auto& group : clauses) {
+                for (const auto& c : group) {
+                    if (c.val.startsWith("/perms") || c.val.startsWith("perms")) {
+                        queryTargetsPerms = true;
+                        break;
+                    }
+                }
+            }
+            if (clauses.size() > 0 && !queryTargetsPerms) {
+                Array<u64> matchedIds = engine.tableStore->getMatchingRowIds(clauses, engine.tableStore->currentSeq, as);
+                ok = true;
+                for (u64 rid : matchedIds) {
+                    String fp = getPathForRowId(rid);
+                    if (fp.startsWith("/perms/")) continue;
+                    Array<Clauses> singleRowClause;
+                    singleRowClause.push(WHERE("::id", "=", String::from(rid)));
+                    bool res = engine.rm(singleRowClause, length, as);
+                    if (!res) ok = false;
+                }
+            } else {
+                ok = engine.rm(clauses, length, as);
+            }
             if (ok) {
                 resp.set("_status", "ok");
                 resp.set("_code", "0");
@@ -849,7 +915,7 @@ void XylemServer::handlePacket(const Packet& p, Tunnel& tunnel) {
                 Array<u64> matchedIds = engine.tableStore->getMatchingRowIds(clauses, engine.tableStore->currentSeq, as);
                 for (usz i = 0; i < matchedIds.size(); ++i) {
                     String filePath = getPathForRowId(matchedIds[i]);
-                    if (filePath.isEmpty()) continue;
+                    if (filePath.isEmpty() || filePath.startsWith("/perms/")) continue;
                     Array<Clauses> rmClauses;
                     rmClauses.push(WHERE("name", "path", getPermPath("owning", filePath)));
                     engine.rm(rmClauses);

@@ -5,12 +5,14 @@
 #include <Xylem/Query.hpp>
 #include <Xylem/BlockDevice.hpp>
 #include <Xylem/Allocator.hpp>
-#include <Collection/Map.hpp>
-#include <Collection/Tree.hpp>
+#include <Ksee/Map.hpp>
+#include <Ksee/Tree.hpp>
 #include <Xylem/HNSW.hpp>
-#include <Xi/Func.hpp>
+#include <Ksee/Func.hpp>
 
 namespace Xylem {
+
+using namespace Ksee;
 
 class BlobStore; // Forward declaration
 class XylemEngine; // Forward declaration
@@ -33,14 +35,12 @@ struct TableSchema {
     Array<ColumnSchema> columns;
 };
 
-class RowNode : public Collection::TaggedTreeBranch {
+class RowNode : public Tree<void> {
 public:
     Map<String, String> row;
     u64 rId;
-    RowNode(u64 id, const Map<String, String>& r) : rId(id), row(r) {
-        this->name = "Row";
-    }
-    virtual Collection::TreeItem* clone() const override {
+    RowNode(u64 id, const Map<String, String>& r) : Tree<void>(String("Row")), row(r), rId(id) {}
+    virtual Tree<void>* clone() const override {
         return new RowNode(rId, row);
     }
 };
@@ -71,6 +71,63 @@ public:
     }
 };
 
+class RowIdIndex {
+public:
+    // Block ID (rId / 1000) -> 125-byte bitmap (1000 bits)
+    Map<u64, Array<u8>> blockBits;
+    usz totalCount = 0;
+
+    bool has(u64 rId) const {
+        u64 bId = rId / 1000;
+        u32 off = (u32)(rId % 1000);
+        const auto* bits = blockBits.get(bId);
+        if (!bits || bits->size() < 125) return false;
+        return ((*bits)[off / 8] & (1 << (off % 8))) != 0;
+    }
+
+    void set(u64 rId, bool val = true) {
+        if (!val) {
+            remove(rId);
+            return;
+        }
+        u64 bId = rId / 1000;
+        u32 off = (u32)(rId % 1000);
+        auto* bits = blockBits.get(bId);
+        if (!bits) {
+            Array<u8> newBits;
+            newBits.allocate(125);
+            for (usz i = 0; i < 125; ++i) newBits[i] = 0;
+            blockBits.set(bId, newBits);
+            bits = blockBits.get(bId);
+        }
+        if (((*bits)[off / 8] & (1 << (off % 8))) == 0) {
+            (*bits)[off / 8] |= (1 << (off % 8));
+            totalCount++;
+        }
+    }
+
+    void remove(u64 rId) {
+        u64 bId = rId / 1000;
+        u32 off = (u32)(rId % 1000);
+        auto* bits = blockBits.get(bId);
+        if (bits && bits->size() >= 125) {
+            if (((*bits)[off / 8] & (1 << (off % 8))) != 0) {
+                (*bits)[off / 8] &= ~(1 << (off % 8));
+                if (totalCount > 0) totalCount--;
+            }
+        }
+    }
+
+    void clear() {
+        blockBits.clear();
+        totalCount = 0;
+    }
+
+    usz size() const {
+        return totalCount;
+    }
+};
+
 class TableStore {
 public:
     BlockDevice* device;
@@ -87,7 +144,7 @@ public:
     u64 nextRowId = 1;
     Map<u64, Map<String, String>> allRows;
     Array<u64> allRowIds;
-    Map<u64, bool> allRowIdsMap;
+    RowIdIndex allRowIdsMap;
     Map<u64, Array<RowVersion>> rowHistory;
     
     struct LruNode {
@@ -101,18 +158,23 @@ public:
 
     Map<u16, Array<u64>> tableToRows;
     Map<u64, bool> volatileRows;
-    
-    Xi::Func<Map<String, String>*(u64)> fetchFromDisk;
-    Xi::Func<void(u64, Map<String, String>*)> saveToDisk;
-    
-    Xi::Func<HNSW::Node*(u64)> fetchHNSWFromDisk;
-    Xi::Func<void(u64, HNSW::Node*)> saveHNSWToDisk;
-    Xi::Func<void(u64)> removeHNSWFromDisk;
+
+    // ─── ID Rent Pool (::id auto-management) ─────────────────────────────────
+    u64 largestAutoId = 0;        // The largest auto-assigned/rented ID seen
+    Array<u64> rentedIds;         // IDs that have been freed and can be reused
+    bool idPoolDirty = false;     // Whether the pool needs saving
+    void saveIdPool();
+    void loadIdPool();
+    u64 claimId();                // Get next available ID (rented first, then ++largestAutoId)
+    void rentId(u64 id);          // Return an ID to the pool
+    Func<HNSW::Node*(u64)> fetchHNSWFromDisk;
+    Func<void(u64, HNSW::Node*)> saveHNSWToDisk;
+    Func<void(u64)> removeHNSWFromDisk;
 
     Array<u64> uningestedVectors;
 
-    Xi::Func<String(const String&)> readBlob;
-    Xi::Func<void(const String&, const String&)> writeBlob;
+    Func<String(const String&)> readBlob;
+    Func<void(const String&, const String&)> writeBlob;
     
     HNSW* hnsw = nullptr; 
 
@@ -137,16 +199,17 @@ public:
     Array<Map<String, String>> read(const Array<String>& columns, const Array<Clauses>& clauses,
                                      u64 length = 0, u64 page = 0, bool tombstones = false,
                                      u64 snapshotSeq = 0, u64 txId = 0,
-                                     bool readAllColumns = false);
+                                     bool readAllColumns = false, u64 now = 0);
     
     int write(const Array<Clause>& columns, const Array<Clauses>& clauses = Array<Clauses>(),
-              const String& encryptionKey = "", u64 txId = 0, bool isVolatile = false);
-    bool rm(const Array<Clauses>& clauses, u64 length = 0, bool burn = false);
+              const String& encryptionKey = "", u64 txId = 0, bool isVolatile = false, u64 now = 0);
+    bool rm(const Array<Clauses>& clauses, u64 length = 0, bool burn = false, u64 now = 0);
 
     Array<u64> getMatchingRowIds(const Array<Clauses>& clauses, u64 snapshotSeq, u64 txId);
     
-    f32 evaluateClauses(const Map<String, String>& row, const Array<Clauses>& clausesGroups, const Map<String, String>* parentRow = nullptr, u64 rId = 0);
-    f32 evaluateClause(const Map<String, String>& row, const Clause& clause, const Map<String, String>* parentRow = nullptr, u64 rId = 0);
+    f32 evaluateClauses(const Map<String, String>& row, const Array<Clauses>& clausesGroups, const Map<String, String>* parentRow = nullptr, u64 rId = 0, u64 snapshotSeq = 0, u64 txId = 0);
+    f32 evaluateClause(const Map<String, String>& row, const Clause& clause, const Map<String, String>* parentRow = nullptr, u64 rId = 0, u64 snapshotSeq = 0, u64 txId = 0);
+
 
     Array<u64> resolvePathPattern(const String& colName, const String& pathPattern, u64 snapshotSeq, u64 txId);
     void resolvePathsInClauses(const Array<Clauses>& clauses, u64 snapshotSeq, u64 txId);
@@ -161,6 +224,7 @@ public:
 
     // Persist all in-memory rows to BlobStore (call on flush/unmount)
     void flushAllRows();
+    void flushDirtyBlock(u64 blockId);
     // Persist HNSW nodes to disk
     void flushHnsw();
 

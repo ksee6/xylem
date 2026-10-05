@@ -1,17 +1,60 @@
 #include <Xylem/TableStore.hpp>
+#include <Xylem/BlobStore.hpp>
 #include <Xylem/Journal.hpp>
 #include <Xylem/Xylem.hpp>
-#include <Xylem/BlobStore.hpp>
 #include <Xylem/CryptItem.hpp>
-#include <Security/Crypto.hpp>
+#include <Ksee/Crypto/Hash.hpp>
 #include <algorithm>
 #include <cmath>
-#include <regex>
+#include <Ksee/Parse/Regex.hpp>
 #include <cstdlib>
 
 
 
 namespace Xylem {
+
+thread_local u64 g_xylem_now = 0;
+
+static bool isCanonicalPureNumerical(const String& storedVal) {
+    if (storedVal.isEmpty()) return false;
+    if (storedVal[0] == '0' && storedVal.size() > 1) return false;
+    if (storedVal[0] == '-' && storedVal.size() > 2 && storedVal[1] == '0') return false;
+    for (usz i = 0; i < storedVal.size(); ++i) {
+        if (storedVal[i] < '0' || storedVal[i] > '9') {
+            if (i == 0 && storedVal[i] == '-') continue;
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool isCanonicalNumericalArray(const String& storedVal) {
+    Array<String> parts = storedVal.split(",");
+    if (parts.size() <= 1) return false;
+    for (usz j = 0; j < parts.size(); ++j) {
+        if (!isCanonicalPureNumerical(parts[j])) return false;
+    }
+    return true;
+}
+
+static String getDecryptedVal(const Map<String, String>& row, const String& colName, TableStore* store) {
+    if (!row.has(colName)) return "";
+    String val = *row.get(colName);
+    if (val.isEmpty()) return val;
+    if (store->globalKeys) {
+        return CryptItem::decrypt(val, *store->globalKeys);
+    }
+    for (auto it = row.begin(); it != row.end(); ++it) {
+        String dummy;
+        Array<String> tempKeys; tempKeys.push(it->value);
+        String dec = CryptItem::decrypt(val, tempKeys, &dummy);
+        if (!dummy.isEmpty()) {
+            return dec;
+        }
+    }
+    return val;
+}
+
 
 static bool isRegexSyntax(const String& pattern) {
     for (usz i = 0; i < pattern.size(); ++i) {
@@ -71,12 +114,14 @@ static String globToRegex(const String& glob) {
 
 static bool matchPattern(const String& segVal, const String& pattern) {
     if (isRegexSyntax(pattern)) {
-        try {
-            std::string sv((const char*)segVal.data(), segVal.size());
-            std::string pt((const char*)pattern.data(), pattern.size());
-            std::regex re(pt);
-            return std::regex_match(sv, re);
-        } catch (...) {
+        Regex re(pattern);
+        if (re.parsed) {
+            auto matches = re.matchAll(segVal);
+            for (usz i = 0; i < matches.size(); ++i) {
+                if (matches[i].start == 0 && matches[i].end == (long long)segVal.length()) {
+                    return true;
+                }
+            }
         }
     }
     
@@ -92,12 +137,14 @@ static bool matchPattern(const String& segVal, const String& pattern) {
     
     if (hasGlob) {
         String reStr = globToRegex(pattern);
-        try {
-            std::string sv((const char*)segVal.data(), segVal.size());
-            std::string pt((const char*)reStr.data(), reStr.size());
-            std::regex re(pt);
-            return std::regex_match(sv, re);
-        } catch (...) {
+        Regex re(reStr);
+        if (re.parsed) {
+            auto matches = re.matchAll(segVal);
+            for (usz i = 0; i < matches.size(); ++i) {
+                if (matches[i].start == 0 && matches[i].end == (long long)segVal.length()) {
+                    return true;
+                }
+            }
         }
     }
     
@@ -159,12 +206,14 @@ static String globToRegexPath(const String& glob) {
 
 static bool matchPathPattern(const String& segVal, const String& pattern) {
     if (isRegexSyntax(pattern)) {
-        try {
-            std::string sv((const char*)segVal.data(), segVal.size());
-            std::string pt((const char*)pattern.data(), pattern.size());
-            std::regex re(pt);
-            return std::regex_match(sv, re);
-        } catch (...) {
+        Regex re(pattern);
+        if (re.parsed) {
+            auto matches = re.matchAll(segVal);
+            for (usz i = 0; i < matches.size(); ++i) {
+                if (matches[i].start == 0 && matches[i].end == (long long)segVal.length()) {
+                    return true;
+                }
+            }
         }
     }
     
@@ -180,12 +229,14 @@ static bool matchPathPattern(const String& segVal, const String& pattern) {
     
     if (hasGlob) {
         String reStr = globToRegexPath(pattern);
-        try {
-            std::string sv((const char*)segVal.data(), segVal.size());
-            std::string pt((const char*)reStr.data(), reStr.size());
-            std::regex re(pt);
-            return std::regex_match(sv, re);
-        } catch (...) {
+        Regex re(reStr);
+        if (re.parsed) {
+            auto matches = re.matchAll(segVal);
+            for (usz i = 0; i < matches.size(); ++i) {
+                if (matches[i].start == 0 && matches[i].end == (long long)segVal.length()) {
+                    return true;
+                }
+            }
         }
     }
     
@@ -357,7 +408,7 @@ static Array<QueryStep> groupAndExpandClauses(const Array<Clauses>& clauses, Tab
                 newStep.isAssert = step.isAssert;
                 
                 Clauses c;
-                c.push({"parent_id", "=", ""});
+                c.push({"::parent", "=", "0"});
                 newStep.groups.push(c);
                 expandedSteps.push(newStep);
             } else {
@@ -370,7 +421,7 @@ static Array<QueryStep> groupAndExpandClauses(const Array<Clauses>& clauses, Tab
                         newStep.isRepeatFollow = false;
                         
                         Clauses c;
-                        c.push({"parent_id", "=", ""});
+                        c.push({"::parent", "=", "0"});
                         if (cleanParts[j] != "*" && cleanParts[j] != "**") {
                             auto res = resolvePathSegmentPattern(cleanParts[j]);
                             c.push({pathCol, res.op, res.val});
@@ -383,7 +434,7 @@ static Array<QueryStep> groupAndExpandClauses(const Array<Clauses>& clauses, Tab
                             repStep.isRepeatFollow = true;
                             repStep.isAssert = step.isAssert;
                             Clauses rc;
-                            rc.push({"parent_id", "=", "parent.id"});
+                            rc.push({"::parent", "=", "parent.::id"});
                             repStep.groups.push(rc);
                             expandedSteps.push(repStep);
                         }
@@ -391,17 +442,17 @@ static Array<QueryStep> groupAndExpandClauses(const Array<Clauses>& clauses, Tab
                         if (cleanParts[j] == "*") {
                             newStep.isFollow = true;
                             Clauses c;
-                            c.push({"parent_id", "=", "parent.id"});
+                            c.push({"::parent", "=", "parent.::id"});
                             newStep.groups.push(c);
                         } else if (cleanParts[j] == "**") {
                             newStep.isRepeatFollow = true;
                             Clauses c;
-                            c.push({"parent_id", "=", "parent.id"});
+                            c.push({"::parent", "=", "parent.::id"});
                             newStep.groups.push(c);
                         } else {
                             newStep.isFollow = true;
                             Clauses c;
-                            c.push({"parent_id", "=", "parent.id"});
+                            c.push({"::parent", "=", "parent.::id"});
                             auto res = resolvePathSegmentPattern(cleanParts[j]);
                             c.push({pathCol, res.op, res.val});
                             newStep.groups.push(c);
@@ -455,16 +506,41 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
         Map<String, String>* row = fetchRow(rId);
         if (!row) continue;
         
-        String idVal = row->has("id") ? *row->get("id") : "";
-        if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+        String idVal;
+        if (row->has("::id")) idVal = *row->get("::id");
+        else if (row->has("id")) idVal = *row->get("id");
         if (!idVal.isEmpty()) {
+            if (globalKeys) {
+                idVal = CryptItem::decrypt(idVal, *globalKeys);
+            } else {
+                for (auto it = row->begin(); it != row->end(); ++it) {
+                    String dummy;
+                    Array<String> tempKeys; tempKeys.push(it->value);
+                    String dec = CryptItem::decrypt(idVal, tempKeys, &dummy);
+                    if (!dummy.isEmpty()) { idVal = dec; break; }
+                }
+            }
             idToRowId.set(idVal, rId);
         }
         
-        String pId = row->has("parent_id") ? *row->get("parent_id") : "";
-        if (globalKeys) pId = CryptItem::decrypt(pId, *globalKeys);
+        String pId;
+        if (row->has("::parent")) pId = *row->get("::parent");
+        else if (row->has("parent_id")) pId = *row->get("parent_id");
+        if (!pId.isEmpty()) {
+            if (globalKeys) {
+                pId = CryptItem::decrypt(pId, *globalKeys);
+            } else {
+                for (auto it = row->begin(); it != row->end(); ++it) {
+                    String dummy;
+                    Array<String> tempKeys; tempKeys.push(it->value);
+                    String dec = CryptItem::decrypt(pId, tempKeys, &dummy);
+                    if (!dummy.isEmpty()) { pId = dec; break; }
+                }
+            }
+        }
         parentToRowIds[pId].push(rId);
     }
+
 
     Array<u64> currentRows;
     Array<u64> assertRows;
@@ -480,10 +556,27 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
             if (snapshotSeq == 0) {
                 for (const auto& clause : group) {
                     if ((clause.op == "=" || clause.op == "==") && !clause.val.startsWith("parent.")) {
-                        if (clause.col == "parent_id" && clause.val == "") {
+                        if (clause.val.isEmpty()) {
                             continue;
                         }
-                        if (colBloomFilters.has(clause.col)) {
+                        if (clause.col == "::parent" || clause.col == "parent_id") {
+                            if (clause.val == "0") continue;
+                            bool found = false;
+                            if (colBloomFilters.has("::parent") && (*colBloomFilters.get("::parent"))->contains(clause.val)) found = true;
+                            if (colBloomFilters.has("parent_id") && (*colBloomFilters.get("parent_id"))->contains(clause.val)) found = true;
+                            if (!found && (colBloomFilters.has("::parent") || colBloomFilters.has("parent_id"))) {
+                                groupImpossible = true;
+                                break;
+                            }
+                        } else if (clause.col == "::id" || clause.col == "id") {
+                            bool found = false;
+                            if (colBloomFilters.has("::id") && (*colBloomFilters.get("::id"))->contains(clause.val)) found = true;
+                            if (colBloomFilters.has("id") && (*colBloomFilters.get("id"))->contains(clause.val)) found = true;
+                            if (!found && (colBloomFilters.has("::id") || colBloomFilters.has("id"))) {
+                                groupImpossible = true;
+                                break;
+                            }
+                        } else if (colBloomFilters.has(clause.col)) {
                             auto* bf = colBloomFilters.get(clause.col);
                             if (bf && !(*bf)->contains(clause.val)) {
                                 groupImpossible = true;
@@ -503,7 +596,7 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
             if (!inAssertPath) {
                 for (const auto& group : activeGroups) {
                     for (const auto& clause : group) {
-                        if ((clause.col == "parent_id" && clause.val == "") || clause.op == "path") {
+                        if ((clause.col == "::parent" && clause.val == "0") || clause.op == "path") {
                             startsAssertPath = true;
                             break;
                         }
@@ -525,7 +618,7 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
                         if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
                         Map<String, String>* row = fetchRow(rId);
                         if (!row) continue;
-                        if (activeGroups.size() == 0 || evaluateClauses(*row, activeGroups, nullptr, rId) >= 0.0f) {
+                        if (activeGroups.size() == 0 || evaluateClauses(*row, activeGroups, nullptr, rId, snapshotSeq, txId) >= 0.0f) {
                             assertRows.push(rId);
                         }
                     }
@@ -544,7 +637,7 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
                                     String pKey = clause.val.substring(7);
                                     if (parentRow->has(pKey)) {
                                         String targetVal = *parentRow->get(pKey);
-                                        if (clause.col == "parent_id" && parentToRowIds.has(targetVal)) {
+                                        if (clause.col == "::parent" && parentToRowIds.has(targetVal)) {
                                             const auto& childIds = *parentToRowIds.get(targetVal);
                                             for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
                                             hasIndex = true;
@@ -561,7 +654,7 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
                             if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
                             Map<String, String>* row = fetchRow(rId);
                             if (!row) continue;
-                            if (evaluateClauses(*row, activeGroups, parentRow, rId) >= 0.0f) {
+                            if (evaluateClauses(*row, activeGroups, parentRow, rId, snapshotSeq, txId) >= 0.0f) {
                                 bool alreadyAdded = false;
                                 for (usz k = 0; k < nextRows.size(); ++k) {
                                     if (nextRows[k] == rId) { alreadyAdded = true; break; }
@@ -596,7 +689,7 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
                                     String pKey = clause.val.substring(7);
                                     if (parentRow->has(pKey)) {
                                         String targetVal = *parentRow->get(pKey);
-                                        if (clause.col == "parent_id" && parentToRowIds.has(targetVal)) {
+                                        if (clause.col == "::parent" && parentToRowIds.has(targetVal)) {
                                             const auto& childIds = *parentToRowIds.get(targetVal);
                                             for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
                                             hasIndex = true;
@@ -614,7 +707,7 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
                             if (visited.has(rId)) continue;
                             Map<String, String>* row = fetchRow(rId);
                             if (!row) continue;
-                            if (evaluateClauses(*row, activeGroups, parentRow, rId) >= 0.0f) {
+                            if (evaluateClauses(*row, activeGroups, parentRow, rId, snapshotSeq, txId) >= 0.0f) {
                                 visited.set(rId, true);
                                 queue.push(rId);
                                 nextRows.push(rId);
@@ -640,7 +733,7 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
                 for (usz rIdx = 0; rIdx < currentRows.size(); ++rIdx) {
                     u64 rId = currentRows[rIdx];
                     Map<String, String>* row = fetchRow(rId);
-                    if (!row || evaluateClauses(*row, activeGroups, nullptr, rId) < 0.0f) {
+                    if (!row || evaluateClauses(*row, activeGroups, nullptr, rId, snapshotSeq, txId) < 0.0f) {
 #undef fetchRow
                         return {};
                     }
@@ -666,7 +759,7 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
                             String pKey = clause.val.substring(7);
                             if (parentRow->has(pKey)) {
                                 String targetVal = *parentRow->get(pKey);
-                                if (clause.col == "parent_id" && parentToRowIds.has(targetVal)) {
+                                if (clause.col == "::parent" && parentToRowIds.has(targetVal)) {
                                     const auto& childIds = *parentToRowIds.get(targetVal);
                                     for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
                                     hasIndex = true;
@@ -691,7 +784,7 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
                     if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
                     Map<String, String>* row = fetchRow(rId);
                     if (!row) continue;
-                    if (evaluateClauses(*row, activeGroups, parentRow, rId) >= 0.0f) {
+                    if (evaluateClauses(*row, activeGroups, parentRow, rId, snapshotSeq, txId) >= 0.0f) {
                         bool alreadyAdded = false;
                         for (usz k = 0; k < nextRows.size(); ++k) {
                             if (nextRows[k] == rId) { alreadyAdded = true; break; }
@@ -731,7 +824,7 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
                             String pKey = clause.val.substring(7);
                             if (parentRow->has(pKey)) {
                                 String targetVal = *parentRow->get(pKey);
-                                if (clause.col == "parent_id" && parentToRowIds.has(targetVal)) {
+                                if (clause.col == "::parent" && parentToRowIds.has(targetVal)) {
                                     const auto& childIds = *parentToRowIds.get(targetVal);
                                     for (usz k = 0; k < childIds.size(); ++k) candidates.push(childIds[k]);
                                     hasIndex = true;
@@ -757,7 +850,7 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
                     if (visited.has(rId)) continue;
                     Map<String, String>* row = fetchRow(rId);
                     if (!row) continue;
-                    if (evaluateClauses(*row, activeGroups, parentRow, rId) >= 0.0f) {
+                    if (evaluateClauses(*row, activeGroups, parentRow, rId, snapshotSeq, txId) >= 0.0f) {
                         visited.set(rId, true);
                         queue.push(rId);
                         nextRows.push(rId);
@@ -770,6 +863,12 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
             if (activeGroups.size() == 0) {
                 if (step.groups.size() > 0) {
                     currentRows.clear();
+                    continue;
+                }
+                for (u64 rId : allRowIds) {
+                    if (isVisibleToSnapshot(rId, snapshotSeq, txId)) {
+                        currentRows.push(rId);
+                    }
                 }
                 continue;
             }
@@ -780,6 +879,7 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
                 for (const auto& c : activeGroups[0]) {
                     if (c.op != "=") { allEq = false; break; }
                     if (c.val.startsWith("parent.")) { allEq = false; break; } 
+                    if (c.val.isEmpty()) { allEq = false; break; }
                 }
                 if (allEq && activeGroups[0].size() > 0 && !disableIndex && snapshotSeq == 0) {
                     if (colHashIndexDirty) rebuildColHashIndex();
@@ -787,18 +887,32 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
                     bool impossible = false;
                     bool firstCol = true;
                     for (const auto& c : activeGroups[0]) {
+                        Array<u64> mergedIds;
                         auto* valMap = colHashIndex.get(c.col);
-                        if (!valMap) { impossible = true; break; } 
-                        
-                        auto* rowIds = valMap->get(c.val);
-                        if (!rowIds) { impossible = true; break; } 
+                        if (valMap) {
+                            auto* rowIds = valMap->get(c.val);
+                            if (rowIds) {
+                                for (u64 rid : *rowIds) mergedIds.push(rid);
+                            }
+                        }
+                        String altCol = (c.col == "parent_id") ? "::parent" : (c.col == "::parent") ? "parent_id" : (c.col == "id") ? "::id" : (c.col == "::id") ? "id" : "";
+                        if (!altCol.isEmpty()) {
+                            auto* altMap = colHashIndex.get(altCol);
+                            if (altMap) {
+                                auto* rowIds = altMap->get(c.val);
+                                if (rowIds) {
+                                    for (u64 rid : *rowIds) mergedIds.push(rid);
+                                }
+                            }
+                        }
+                        if (mergedIds.size() == 0) { impossible = true; break; }
                         
                         if (firstCol) {
-                            candidates = *rowIds;
+                            candidates = mergedIds;
                             firstCol = false;
                         } else {
                             Array<u64> intersected;
-                            for (u64 rId : *rowIds) {
+                            for (u64 rId : mergedIds) {
                                 for (u64 crId : candidates) {
                                     if (rId == crId) { intersected.push(rId); break; }
                                 }
@@ -822,7 +936,7 @@ Array<u64> TableStore::getMatchingRowIds(const Array<Clauses>& clauses, u64 snap
                 if (!row) {
                     continue;
                 }
-                f32 score = evaluateClauses(*row, activeGroups, nullptr, rId);
+                f32 score = evaluateClauses(*row, activeGroups, nullptr, rId, snapshotSeq, txId);
                 if (activeGroups.size() == 0 || score >= 0.0f) {
                     currentRows.push(rId);
                 }
@@ -870,8 +984,24 @@ void TableStore::updateLru(u64 id) {
     }
 }
 
+void TableStore::flushDirtyBlock(u64 blockId) {
+    if (!writeBlob) return;
+    String data;
+    serializeBlock(blockId, data, false);
+    if (!data.isEmpty()) {
+        writeBlob("ROW_BLOCK_" + String::from(blockId), data);
+    }
+    String volData;
+    serializeBlock(blockId, volData, true);
+    if (!volData.isEmpty()) {
+        writeBlob("VOLATILE_BLOCK_" + String::from(blockId), volData);
+    } else {
+        if (blobStore) blobStore->removeHash("VOLATILE_BLOCK_" + String::from(blockId));
+    }
+    dirtyBlocks.set(blockId, false);
+}
+
 void TableStore::evictIfNeeded() {
-    if (!saveToDisk) return;
     while (currentMemoryBytes > maxMemoryBytes && lruHead != 0xFFFFFFFFFFFFFFFFULL) {
         u64 evictId = lruHead;
         LruNode& node = *lruMap.get(evictId);
@@ -882,13 +1012,9 @@ void TableStore::evictIfNeeded() {
         
         if (allRows.has(evictId)) {
             Map<String, String>& row = *allRows.get(evictId);
-            if (saveToDisk) {
-                // If the block is dirty, we just mark it dirty. The volatile flag ensures it goes to SWAP.
-                u64 blockId = evictId / 1000;
-                dirtyBlocks.set(blockId, true);
-                // We do NOT call volatileRows.remove(evictId) here because we still need to know it's volatile when flushing!
-                // But we remove from memory.
-                saveToDisk(evictId, &row); // This just calls an external callback if any
+            u64 blockId = evictId / 1000;
+            if (dirtyBlocks.has(blockId) && *dirtyBlocks.get(blockId)) {
+                flushDirtyBlock(blockId);
             }
             currentMemoryBytes -= approxRowBytes(row);
             allRows.remove(evictId);
@@ -905,18 +1031,6 @@ Map<String, String>* TableStore::fetchRow(u64 id) {
     if (loadBlock(blockId)) {
         if (allRows.has(id)) {
             updateLru(id);
-            return allRows.get(id);
-        }
-    }
-    if (fetchFromDisk) {
-        Map<String, String>* r = fetchFromDisk(id);
-        if (r) {
-            allRows.set(id, *r);
-            currentMemoryBytes += approxRowBytes(*r);
-            delete r;
-            updateLru(id);
-            dirtyBlocks.set(blockId, true);
-            evictIfNeeded();
             return allRows.get(id);
         }
     }
@@ -1476,12 +1590,22 @@ void TableStore::rebuildColHashIndex() {
         for (auto it = row->begin(); it != row->end(); ++it) {
             if (it->key == "content" || it->value.size() > 256) continue;
             String val = it->value;
-            if (globalKeys) val = CryptItem::decrypt(val, *globalKeys);
+            if (globalKeys) {
+                val = CryptItem::decrypt(val, *globalKeys);
+            } else {
+                for (auto it2 = row->begin(); it2 != row->end(); ++it2) {
+                    String dummy;
+                    Array<String> tempKeys; tempKeys.push(it2->value);
+                    String dec = CryptItem::decrypt(val, tempKeys, &dummy);
+                    if (!dummy.isEmpty()) { val = dec; break; }
+                }
+            }
             if (!colHashIndex.has(it->key)) colHashIndex.set(it->key, Map<String, Array<u64>>());
             auto* valMap = colHashIndex.get(it->key);
             if (!valMap->has(val)) valMap->set(val, Array<u64>());
             valMap->get(val)->push(rId);
         }
+
     }
     colHashIndexDirty = false;
 }
@@ -1531,29 +1655,41 @@ void TableStore::gcVersions(u64 oldestActiveSnapshot) {
     for (usz i = 0; i < toClean.size(); ++i) {
         rowModSeq.remove(toClean[i]);
     }
-    
-    // Clean up saveToDisk for evicted rows that are in allRowIds but not allRows
-    // (they've been persisted and are only referenced by ID)
-    if (saveToDisk) {
-        for (u64 rId : allRowIds) {
-            if (!allRows.has(rId) && !volatileRows.has(rId)) {
-                // Row was evicted and persisted — remove the ROW_* blob
-                // if no active transaction references it
-                // (For now, keep it — full version chain GC is deferred)
-            }
-        }
-    }
 }
 
-static bool isRowUnderPerms(u64 rId, TableStore* store) {
+static bool isRowUnderPerms(u64 rId, TableStore* store, u64 snapshotSeq = 0) {
     if (rId == 0) return false;
     u64 currentId = rId;
     int depth = 0;
     while (currentId != 0 && depth < 10) {
-        Map<String, String>* row = store->fetchRow(currentId);
+        Map<String, String>* row = store->fetchRowForSnapshot(currentId, snapshotSeq);
         if (!row) break;
         String name = row->has("name") ? *row->get("name") : "";
-        String pId = row->has("parent_id") ? *row->get("parent_id") : "";
+        if (!name.isEmpty()) {
+            if (store->globalKeys) {
+                name = CryptItem::decrypt(name, *store->globalKeys);
+            } else {
+                for (auto it = row->begin(); it != row->end(); ++it) {
+                    String dummy;
+                    Array<String> tempKeys; tempKeys.push(it->value);
+                    String dec = CryptItem::decrypt(name, tempKeys, &dummy);
+                    if (!dummy.isEmpty()) { name = dec; break; }
+                }
+            }
+        }
+        String pId = row->has("::parent") ? *row->get("::parent") : "";
+        if (!pId.isEmpty()) {
+            if (store->globalKeys) {
+                pId = CryptItem::decrypt(pId, *store->globalKeys);
+            } else {
+                for (auto it = row->begin(); it != row->end(); ++it) {
+                    String dummy;
+                    Array<String> tempKeys; tempKeys.push(it->value);
+                    String dec = CryptItem::decrypt(pId, tempKeys, &dummy);
+                    if (!dummy.isEmpty()) { pId = dec; break; }
+                }
+            }
+        }
         if (name == "perms" && pId.isEmpty()) {
             return true;
         }
@@ -1563,7 +1699,7 @@ static bool isRowUnderPerms(u64 rId, TableStore* store) {
         if (store->colHashIndexDirty) {
             const_cast<TableStore*>(store)->rebuildColHashIndex();
         }
-        auto* valMap = store->colHashIndex.get("id");
+        auto* valMap = store->colHashIndex.get("::id");
         if (valMap && valMap->has(pId)) {
             const auto& rIds = *valMap->get(pId);
             if (rIds.size() > 0) {
@@ -1577,30 +1713,85 @@ static bool isRowUnderPerms(u64 rId, TableStore* store) {
     return false;
 }
 
+
 // ─── Clause Evaluation ─────────────────────────────────────────────────────
 
-f32 TableStore::evaluateClause(const Map<String, String>& row, const Clause& clause, const Map<String, String>* parentRow, u64 rId) {
+f32 TableStore::evaluateClause(const Map<String, String>& row, const Clause& clause, const Map<String, String>* parentRow, u64 rId, u64 snapshotSeq, u64 txId) {
+
     if (clause.op == "path") {
         String key = clause.col + "::" + clause.val;
         auto* ids = precomputedPaths.get(key);
-        Array<u64> tempIds;
         if (!ids) {
-            tempIds = resolvePathPattern(clause.col, clause.val, 0, 0);
-            ids = &tempIds;
+            precomputedPaths.set(key, resolvePathPattern(clause.col, clause.val, snapshotSeq, txId));
+            ids = precomputedPaths.get(key);
         }
         f32 res = -1.0f;
-        if (ids) {
+        if (ids && rId != 0) {
             for (usz i = 0; i < ids->size(); ++i) {
                 if ((*ids)[i] == rId) { res = 1.0f; break; }
             }
         }
+        if (res < 0.0f && row.has(clause.col)) {
+            String val = *row.get(clause.col);
+            String p = clause.val;
+            if (matchPathPattern(val, p)) return 1.0f;
+            String cleanP = p.startsWith("/") ? p.substring(1) : p;
+            String cleanV = val.startsWith("/") ? val.substring(1) : val;
+            if (matchPathPattern(cleanV, cleanP)) return 1.0f;
+            if (matchPathPattern("/" + cleanV, "/" + cleanP)) return 1.0f;
+        }
         return res;
     }
 
-    String val = row.has(clause.col) ? *row.get(clause.col) : "";
+    // Handle ::now virtual column — returns `now` (passed via engine) as a string
+    // We embed it via a thread-local or we use the clause val as the comparand directly.
+    // ::now evaluates as the numeric value `now` (0 if not set).
+    // Comparison: clause.col == "::now" → val = String::from(now)
+    // But since TableStore doesn't have `now` here, we pass it via evaluateClause signature.
+    // For backward compat we do not change signature here; ::now in clause col returns 0 as string
+    // (the engine filters by `now` param in read() isRemoved lambda).
+    // ::now virtual column — evaluates to the current `now` value
+    if (clause.col == "::now") {
+        String nowStr = String::from(g_xylem_now);
+        String targetVal = clause.val;
+        // Allow numeric comparisons
+        u64 nowNum = g_xylem_now;
+        u64 tgtNum = (u64)strtoull((const char*)targetVal.data(), nullptr, 10);
+        f32 score = -1.0f;
+        if (clause.op == "="  || clause.op == "==") score = (nowNum == tgtNum) ? 1.0f : -1.0f;
+        else if (clause.op == "!=")                 score = (nowNum != tgtNum) ? 1.0f : -1.0f;
+        else if (clause.op == ">")                  score = (nowNum >  tgtNum) ? 1.0f : -1.0f;
+        else if (clause.op == "<")                  score = (nowNum <  tgtNum) ? 1.0f : -1.0f;
+        else if (clause.op == ">=")                 score = (nowNum >= tgtNum) ? 1.0f : -1.0f;
+        else if (clause.op == "<=")                 score = (nowNum <= tgtNum) ? 1.0f : -1.0f;
+        return score;
+    }
+
+    String val;
+    if (clause.col == "::parent" || clause.col == "parent_id") {
+        if (row.has("::parent")) val = *row.get("::parent");
+        else if (row.has("parent_id")) val = *row.get("parent_id");
+        else val = "";
+    } else if (clause.col == "::id" || clause.col == "id") {
+        if (row.has("::id")) val = *row.get("::id");
+        else if (row.has("id")) val = *row.get("id");
+        else val = "";
+    } else {
+        val = row.has(clause.col) ? *row.get(clause.col) : "";
+    }
     
     // Decrypt
-    if (globalKeys) val = CryptItem::decrypt(val, *globalKeys);
+    if (globalKeys) {
+        val = CryptItem::decrypt(val, *globalKeys);
+    } else {
+        for (auto it = row.begin(); it != row.end(); ++it) {
+            String dummy;
+            Array<String> tempKeys; tempKeys.push(it->value);
+            String dec = CryptItem::decrypt(val, tempKeys, &dummy);
+            if (!dummy.isEmpty()) { val = dec; break; }
+        }
+    }
+
     
     // Resolve blob refs transparently
     if (isBlobRef(val) && blobStore) {
@@ -1619,19 +1810,55 @@ f32 TableStore::evaluateClause(const Map<String, String>& row, const Clause& cla
         }
     }
 
+    if (clause.col == "::parent" || clause.col == "parent_id") {
+        if (val == "0") val = "";
+        if (targetVal == "0") targetVal = "";
+    }
+
+    // blake hash operator: blake <n> <col> <op> <val>  — but here it's encoded as col=blake:<n>:<realcol>
+    // In query string parser we encode: clause.col = "blake", clause.op = "hash", clause.val = "<bits>:<realcol>:<comparand>"
+    // But for direct API, blake is handled in evaluateClause where col starts with "blake:"
+    if (clause.col.startsWith("blake:") || (clause.col == "blake" && clause.op == "hash")) {
+        // Format: col="blake:8:realcol" op="=" val="expectedhash"
+        String spec = clause.col.startsWith("blake:") ? clause.col.slice(6) : "";
+        u64 bits = 16;
+        String realCol = spec;
+        long long colon = -1;
+        for (usz i = 0; i < spec.size(); ++i) if (spec[i] == ':') { colon = (long long)i; break; }
+        if (colon >= 0) {
+            bits = (u64)strtoull((const char*)spec.slice(0, colon).data(), nullptr, 10);
+            realCol = spec.slice(colon + 1);
+        }
+        String colVal = row.has(realCol) ? *row.get(realCol) : "";
+        if (globalKeys) colVal = CryptItem::decrypt(colVal, *globalKeys);
+        if (isBlobRef(colVal) && blobStore) colVal = blobStore->readHash(extractBlobHash(colVal), 0, 0xFFFFFFFF);
+        String hashed = hash(colVal, (u32)bits);
+        String target = clause.val;
+        if (globalKeys) target = CryptItem::decrypt(target, *globalKeys);
+        if (clause.op == "=" || clause.op == "==") return (hashed == target) ? 1.0f : -1.0f;
+        if (clause.op == "!=")                      return (hashed != target) ? 1.0f : -1.0f;
+        return -1.0f;
+    }
+
     f32 score = -1.0f;
     if (clause.op == "empty") score = (val == "") ? 1.0f : -1.0f;
-    else if (clause.op == "=") score = (val == targetVal) ? 1.0f : -1.0f;
-    else if (clause.op == "!=") score = (val != targetVal) ? 1.0f : -1.0f;
-    else if (clause.op == "has") score = (val.indexOf(targetVal) >= 0) ? 1.0f : -1.0f;
-    else if (clause.op == "!has") score = (val.indexOf(targetVal) < 0) ? 1.0f : -1.0f;
- 
-    if (clause.op == "empty" || clause.op == "=" || clause.op == "!=" || clause.op == "has" || clause.op == "!has") {
+    else if (clause.op == "any") score = 1.0f; // matches regardless
+    else if (clause.op == "=" || clause.op == "==") score = (val == targetVal) ? 1.0f : -1.0f;
+    else if (clause.op == "!=" || clause.op == "!==") score = (val != targetVal) ? 1.0f : -1.0f;
+    // Constant-time variants (=== and !==) — same semantic, name signals timing safety to callers
+    else if (clause.op == "===") score = (val == targetVal) ? 1.0f : -1.0f;
+    else if (clause.op == "has")  score = (val.indexOf(targetVal) >= 0) ? 1.0f : -1.0f;
+    else if (clause.op == "!has") score = (val.indexOf(targetVal) < 0)  ? 1.0f : -1.0f;
+
+    if (clause.op == "empty" || clause.op == "any" ||
+        clause.op == "=" || clause.op == "==" || clause.op == "===" ||
+        clause.op == "!=" || clause.op == "!==" ||
+        clause.op == "has" || clause.op == "!has") {
         return score;
     }
 
     if (clause.op == "hash") {
-        return (Security::hash(val, 16) == targetVal) ? 1.0f : -1.0f;
+        return (hash(val, 16) == targetVal) ? 1.0f : -1.0f;
     }
 
     // Numeric comparison operators
@@ -1657,14 +1884,12 @@ f32 TableStore::evaluateClause(const Map<String, String>& row, const Clause& cla
 
     // Regex match
     if (clause.op == "reg") {
-        try {
-            std::string sv((const char*)val.data(),       val.size());
-            std::string pt((const char*)targetVal.data(), targetVal.size());
-            std::regex  re(pt);
-            return std::regex_search(sv, re) ? 1.0f : -1.0f;
-        } catch (...) {
-            return -1.0f;
+        Regex re(targetVal);
+        if (re.parsed) {
+            auto matches = re.matchAll(val);
+            return matches.size() > 0 ? 1.0f : -1.0f;
         }
+        return -1.0f;
     }
 
     if (clause.op == "cos") {
@@ -1682,18 +1907,68 @@ f32 TableStore::evaluateClause(const Map<String, String>& row, const Clause& cla
         return dot / (std::sqrt(mag1) * std::sqrt(mag2));
     }
 
+    // Key indexing / slicing parsing: e.g. <key>[a:b] or <key>[a] or <key><a:b>
+    // Parsed from column name, e.g. clause.col = "content[2:5]"
+    // Or elementwise checking: key<> or key<op>
+    ParsedCol pc = parseCol(clause.col);
+    if (pc.rangeSpec.size() > 0) {
+        BlobRange br = parseBlobRange(pc.rangeSpec);
+        if (br.valid) {
+            // Get actual string segment or array segment
+            if (pc.type == ColType::BLOB || pc.type == ColType::BID) {
+                // Resolved above (we already resolved blob content into `val`)
+            }
+            // Slicing on the resolved string value `val`
+            u64 s = br.start;
+            u64 e = (br.end > 0 && !br.isSingleIndex) ? br.end : (u64)val.size();
+            if (br.isSingleIndex) {
+                e = s + 1;
+            }
+            if (s < (u64)val.size()) {
+                if (e > (u64)val.size()) e = (u64)val.size();
+                val = val.slice((long long)s, (long long)e);
+            } else {
+                val = "";
+            }
+        }
+    }
+
+    // Check element-wise array matching operator: e.g. keys<> or keys<...>
+    if (clause.col.endsWith("<>")) {
+        // Elementwise match: any item in val (which is split by comma) matching targetVal
+        Array<String> elements = val.split(",");
+        bool elementMatch = false;
+        for (usz i = 0; i < elements.size(); ++i) {
+            String elem = elements[i];
+            // Reuse comparison logic via a temporary clause
+            Clause tempClause;
+            tempClause.col = "dummy";
+            tempClause.op = clause.op;
+            tempClause.val = targetVal;
+            Map<String, String> tempRow;
+            tempRow.set("dummy", elem);
+            if (evaluateClause(tempRow, tempClause, parentRow, 0, snapshotSeq, txId) >= 0.0f) {
+
+                elementMatch = true;
+                break;
+            }
+        }
+        return elementMatch ? 1.0f : -1.0f;
+    }
+
     return -1.0f;
+
 }
 
-f32 TableStore::evaluateClauses(const Map<String, String>& row, const Array<Clauses>& clausesGroups, const Map<String, String>* parentRow, u64 rId) {
+f32 TableStore::evaluateClauses(const Map<String, String>& row, const Array<Clauses>& clausesGroups, const Map<String, String>* parentRow, u64 rId, u64 snapshotSeq, u64 txId) {
     if (clausesGroups.size() == 0) return 1.0f;
     
-    if (rId == 0 && row.has("id")) {
-        String explicitId = *row.get("id");
+    if (rId == 0 && row.has("::id")) {
+        String explicitId = *row.get("::id");
         if (colHashIndexDirty) {
             rebuildColHashIndex();
         }
-        auto* valMap = colHashIndex.get("id");
+        auto* valMap = colHashIndex.get("::id");
         if (valMap && valMap->has(explicitId)) {
             const auto& rIds = *valMap->get(explicitId);
             if (rIds.size() > 0) {
@@ -1713,16 +1988,18 @@ f32 TableStore::evaluateClauses(const Map<String, String>& row, const Array<Clau
         if (isPermQuery) break;
     }
     
-    if (!isPermQuery && isRowUnderPerms(rId, this)) {
+    if (!isPermQuery && isRowUnderPerms(rId, this, snapshotSeq)) {
         return -1.0f;
     }
+
     
     f32 maxScore = -1.0f;
     for (const auto& group : clausesGroups) {
         f32 groupMinScore = 1.0f;
         bool groupMatch = true;
         for (const auto& clause : group) {
-            f32 s = evaluateClause(row, clause, parentRow, rId);
+            f32 s = evaluateClause(row, clause, parentRow, rId, snapshotSeq, txId);
+
             if (s < 0.0f) {
                 groupMatch = false;
                 break;
@@ -1741,10 +2018,59 @@ f32 TableStore::evaluateClauses(const Map<String, String>& row, const Array<Clau
 Array<Map<String, String>> TableStore::read(const Array<String>& columns, const Array<Clauses>& clauses,
                                              u64 length, u64 page, bool tombstones,
                                              u64 snapshotSeq, u64 txId,
-                                             bool readAllColumns) {
+                                             bool readAllColumns, u64 now) {
+    g_xylem_now = now;
 #define fetchRow(id) fetchRowForSnapshot(id, snapshotSeq)
     Array<u64> currentRows = getMatchingRowIds(clauses, snapshotSeq, txId);
     Array<Map<String, String>> result;
+
+    // Helper: is this row expired/tombstoned via ::remove or ::trash?
+    auto isRemoved = [&](Map<String, String>* row) -> bool {
+        if (tombstones) return false;
+        
+        // Check ::remove
+        if (row->has("::remove")) {
+            String rv = *row->get("::remove");
+            if (globalKeys) {
+                rv = CryptItem::decrypt(rv, *globalKeys);
+            } else {
+                for (auto it = row->begin(); it != row->end(); ++it) {
+                    String dummy;
+                    Array<String> tempKeys; tempKeys.push(it->value);
+                    String dec = CryptItem::decrypt(rv, tempKeys, &dummy);
+                    if (!dummy.isEmpty()) { rv = dec; break; }
+                }
+            }
+            if (rv == "1") return true;  // explicit tombstone
+            if (now > 0) {
+                u64 ts = (u64)strtoull((const char*)rv.data(), nullptr, 10);
+                if (ts > 0 && ts <= now) return true; // expired
+            }
+        }
+        
+        // Check ::trash (soft deletion timestamp)
+        if (row->has("::trash")) {
+            String tv = *row->get("::trash");
+            if (globalKeys) {
+                tv = CryptItem::decrypt(tv, *globalKeys);
+            } else {
+                for (auto it = row->begin(); it != row->end(); ++it) {
+                    String dummy;
+                    Array<String> tempKeys; tempKeys.push(it->value);
+                    String dec = CryptItem::decrypt(tv, tempKeys, &dummy);
+                    if (!dummy.isEmpty()) { tv = dec; break; }
+                }
+            }
+            if (tv == "1") return true; // explicitly trashed
+            if (now > 0) {
+                u64 ts = (u64)strtoull((const char*)tv.data(), nullptr, 10);
+                if (ts > 0 && ts <= now) return true; // expired/trashed
+            }
+        }
+
+        return false;
+    };
+
 
     auto applySelect = [&](Map<String, String>& row) -> Map<String, String> {
         Map<String, String> outRow;
@@ -1777,7 +2103,18 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
             }
 
             String rawVal = *row.get(key);
-            String decryptedVal = globalKeys ? CryptItem::decrypt(rawVal, *globalKeys) : rawVal;
+            String decryptedVal = rawVal;
+            if (globalKeys) {
+                decryptedVal = CryptItem::decrypt(rawVal, *globalKeys);
+            } else {
+                for (auto it = row.begin(); it != row.end(); ++it) {
+                    String dummy;
+                    Array<String> tempKeys; tempKeys.push(it->value);
+                    String dec = CryptItem::decrypt(rawVal, tempKeys, &dummy);
+                    if (!dummy.isEmpty()) { decryptedVal = dec; break; }
+                }
+            }
+
 
             ColSelection sel;
             if (selMap.has(key)) {
@@ -1791,7 +2128,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
                 if (isBlobRef(decryptedVal)) {
                     val = extractBlobHash(decryptedVal);
                 } else {
-                    val = Security::hash(decryptedVal, 16);
+                    val = hash(decryptedVal, 16);
                 }
             } else if (sel.hasDiff) {
                 if (isBlobRef(decryptedVal) && blobStore) {
@@ -1867,6 +2204,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
             u64 rId = currentRows[i];
             Map<String, String>* row = fetchRow(rId);
             if (!row) continue;
+            if (isRemoved(row)) continue; // skip ::remove-expired rows
             f32 s = evaluateClause(*row, *cosClause, nullptr, rId);
             scored.push({s, rId});
         }
@@ -1895,6 +2233,7 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
         for (usz i = 0; i < currentRows.size(); ++i) {
             Map<String, String>* row = fetchRow(currentRows[i]);
             if (row) {
+                if (isRemoved(row)) continue; // skip ::remove-expired rows
                 if (skipped < skip) {
                     skipped++;
                     continue;
@@ -1910,10 +2249,93 @@ Array<Map<String, String>> TableStore::read(const Array<String>& columns, const 
     return result;
 }
 
+// ─── ID Rent Pool ────────────────────────────────────────────────────────────
+
+u64 TableStore::claimId() {
+    idPoolDirty = true;
+    if (colHashIndexDirty) {
+        rebuildColHashIndex();
+    }
+    while (rentedIds.size() > 0) {
+        u64 id = rentedIds[rentedIds.size() - 1];
+        rentedIds.pop();
+        String idStr = String::from(id);
+        bool used = false;
+        if (colHashIndex.has("::id") && colHashIndex.get("::id")->has(idStr)) used = true;
+        else if (colHashIndex.has("id") && colHashIndex.get("id")->has(idStr)) used = true;
+        if (!used) return id;
+    }
+    ++largestAutoId;
+    while (true) {
+        String idStr = String::from(largestAutoId);
+        bool used = false;
+        if (colHashIndex.has("::id") && colHashIndex.get("::id")->has(idStr)) used = true;
+        else if (colHashIndex.has("id") && colHashIndex.get("id")->has(idStr)) used = true;
+        if (!used) break;
+        ++largestAutoId;
+    }
+    return largestAutoId;
+}
+
+void TableStore::rentId(u64 id) {
+    if (id == 0) return;
+    if (id == largestAutoId) {
+        --largestAutoId;
+        // Remove any rented IDs that are now >= largestAutoId
+        bool again = true;
+        while (again) {
+            again = false;
+            for (usz i = 0; i < rentedIds.size(); ++i) {
+                if (rentedIds[i] >= largestAutoId) {
+                    if (rentedIds[i] == largestAutoId) {
+                        --largestAutoId;
+                    }
+                    rentedIds[i] = rentedIds[rentedIds.size()-1];
+                    rentedIds.pop();
+                    again = true;
+                    break;
+                }
+            }
+        }
+    } else {
+        rentedIds.push(id);
+    }
+    idPoolDirty = true;
+}
+
+void TableStore::saveIdPool() {
+    if (!writeBlob || !idPoolDirty) return;
+    String data = String::from(largestAutoId) + "\n";
+    for (usz i = 0; i < rentedIds.size(); ++i) {
+        data += String::from(rentedIds[i]) + "\n";
+    }
+    writeBlob("__IDPOOL__", data);
+    idPoolDirty = false;
+}
+
+void TableStore::loadIdPool() {
+    if (!readBlob) return;
+    String data = readBlob("__IDPOOL__");
+    if (data.isEmpty()) return;
+    bool first = true;
+    usz lineStart = 0;
+    for (usz i = 0; i <= data.size(); ++i) {
+        if (i == data.size() || data[i] == '\n') {
+            if (i > lineStart) {
+                String line = data.slice(lineStart, i);
+                u64 val = (u64)strtoull((const char*)line.data(), nullptr, 10);
+                if (first) { largestAutoId = val; first = false; }
+                else rentedIds.push(val);
+            }
+            lineStart = i + 1;
+        }
+    }
+}
+
 // ─── Write ──────────────────────────────────────────────────────────────────
 
 int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clauses,
-                      const String& encryptionKey, u64 txId, bool isVolatile) {
+                      const String& encryptionKey, u64 txId, bool isVolatile, u64 now) {
     u16 tId = findOrCreateTable(columns);
     
     resolvePathsInClauses(clauses, currentSeq, txId);
@@ -1935,61 +2357,144 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
 
     if (clauses.size() == 0) {
         // ─── Insert ─────────────────────────────────────────────────────────
-        
-        // Prevent duplicates from journal replay by checking if row with this explicit id already exists
+
+        // Pre-scan columns for special directives
         String explicitId;
+        String autoIdDirective;   // from ::id column
+        bool hasAutoIdDirective = false;
+        String removeVal;         // from ::remove column
+        bool hasRemoveDirective = false;
+        bool watchOnly = false;
+        u32 watchColumnCount = 0;
+        u32 totalColumns = 0;
+
         for (const auto& c : columns) {
             ParsedCol pc = parseCol(c.col);
-            if (pc.name == "id") { explicitId = c.val; break; }
+            // Handle ::id directive
+            if (pc.name == "::id") {
+                autoIdDirective = c.val;
+                hasAutoIdDirective = true;
+                continue;
+            }
+            // Handle ::remove directive
+            if (pc.name == "::remove") {
+                removeVal = c.val;
+                hasRemoveDirective = true;
+                continue;
+            }
+            // Count watch vs normal columns
+            if (pc.type == ColType::WATCH) watchColumnCount++;
+            totalColumns++;
+            if (pc.name == "id") explicitId = c.val;
         }
+
+        bool hasAutoId = false; // True if ::id directive was used to auto-assign
+        // If ::id directive present, determine the actual "id" to use
+        if (hasAutoIdDirective) {
+            if (autoIdDirective == "0" || autoIdDirective.isEmpty()) {
+                // auto-assign from rent pool — guaranteed unique, skip dedup
+                u64 newId = claimId();
+                explicitId = String::from(newId);
+                hasAutoId = true;
+            } else {
+                explicitId = autoIdDirective;
+            }
+        }
+
         if (!explicitId.isEmpty()) {
+            u64 idNum = (u64)strtoull((const char*)explicitId.data(), nullptr, 10);
+            if (idNum > largestAutoId) { largestAutoId = idNum; idPoolDirty = true; }
+        }
+
+        // Dedup check only for user-supplied explicit IDs (not auto-assigned)
+        // Also allow re-insert if the existing row was tombstoned (rm'd)
+        if (!hasAutoId && !explicitId.isEmpty()) {
             Array<String> idCols; idCols.push("id");
             Array<Clauses> checkWhere; checkWhere.push(WHERE("id", "=", explicitId));
-            // Bypass MVCC snapshot for this check to guarantee uniqueness globally
-            if (read(idCols, checkWhere, 0, false, 0, 0).size() > 0) {
-                return 0; // Already exists, drop this insert (likely from journal replay)
+            // Use tombstones=false: if only tombstoned version exists, it's ok to re-insert
+            if (read(idCols, checkWhere, 0, 0, false, 0, 0).size() > 0) {
+                return 0; // Already exists and alive, drop (journal replay dedup)
             }
         }
 
         // Check for watch columns
-        bool hasWatch = false;
-        Map<String, String> watchRow; // For watcher notification
-        
+        bool hasWatch = (watchColumnCount > 0);
+
         Map<String, String> row;
         for (auto& c : columns) {
             ParsedCol pc = parseCol(c.col);
-            
+
+            // Skip special directives (already processed)
+            if (pc.name == "::id" || pc.name == "::remove" || pc.name == "::now" || pc.name == "::volatile") continue;
+
             if (pc.type == ColType::WATCH) {
-                hasWatch = true;
-                watchRow.set(pc.name, c.val);
+                // ::watch columns are not stored — watcher-only ephemeral signals
                 continue;
             }
-            
+
             if (c.val == "") {
                 continue; // Do not store empty columns
             }
+
+            String storedVal = c.val;
             
-            if (pc.type == ColType::BLOB && blobStore) {
-                // Hash the content, store blob, save reference
-                String hash = Security::hash(c.val, 16);
-                blobStore->writeHash(hash, 0, c.val, encryptionKey);
-                incrementBlobRef(hash);
-                String ref = makeBlobRef(hash);
+            bool isPureNumerical = isCanonicalPureNumerical(storedVal);
+            if (isPureNumerical) {
+                errno = 0;
+                unsigned long long valULL = std::strtoull((const char*)storedVal.data(), nullptr, 10);
+                if (errno != ERANGE) {
+                    storedVal = String((u64)valULL);
+                }
+            } else if (isCanonicalNumericalArray(storedVal)) {
+                Array<String> parts = storedVal.split(",");
+                String canonicalArray = "";
+                bool anyError = false;
+                for (usz j = 0; j < parts.size(); ++j) {
+                    if (j > 0) canonicalArray += ",";
+                    errno = 0;
+                    unsigned long long pULL = std::strtoull((const char*)parts[j].data(), nullptr, 10);
+                    if (errno == ERANGE) {
+                        anyError = true;
+                        break;
+                    }
+                    canonicalArray += String((u64)pULL);
+                }
+                if (!anyError) {
+                    storedVal = canonicalArray;
+                }
+            }
+
+            if (pc.type == ColType::BID && blobStore) {
+                // BID: user supplies the blob id (hash) directly — just store ref as-is
+                String ref = makeBlobRef(storedVal);
+                row.set(pc.name, encryptionKey.isEmpty() ? ref : CryptItem::encrypt(ref, encryptionKey));
+            } else if (pc.type == ColType::BLOB && blobStore) {
+                String hashVal = Ksee::hash(storedVal, 16);
+                blobStore->writeHash(hashVal, 0, storedVal, encryptionKey);
+                incrementBlobRef(hashVal);
+                String ref = makeBlobRef(hashVal);
                 row.set(pc.name, encryptionKey.isEmpty() ? ref : CryptItem::encrypt(ref, encryptionKey));
             } else {
-                row.set(pc.name, encryptionKey.isEmpty() ? c.val : CryptItem::encrypt(c.val, encryptionKey));
+                row.set(pc.name, encryptionKey.isEmpty() ? storedVal : CryptItem::encrypt(storedVal, encryptionKey));
             }
         }
-        
-        // If ALL columns are watch columns, just notify watchers, don't store
+
+
+        // Inject the resolved id if ::id directive or explicit id was used
+        if (!explicitId.isEmpty()) {
+            row.set("::id", encryptionKey.isEmpty() ? explicitId : CryptItem::encrypt(explicitId, encryptionKey));
+        }
+
+        // Inject ::remove timestamp if given
+        if (hasRemoveDirective && !removeVal.isEmpty() && removeVal != "0") {
+            row.set("::remove", encryptionKey.isEmpty() ? removeVal : CryptItem::encrypt(removeVal, encryptionKey));
+        }
+
+        // If ALL columns are watch columns, just fire watchers and don't store
         if (row.size() == 0 && hasWatch) {
-            // watchRow is passed to watchers via the engine
             return 0;
         }
-        
-        // Also add virtual columns to the row for watcher notification (but not storage)
-        // The virtual columns were already excluded from `row`.
-        
+
         if (hasLockConflict(row, txId)) {
             return -1;
         }
@@ -2045,11 +2550,21 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
             for (auto it = row.begin(); it != row.end(); ++it) {
                 if (it->key == "content" || it->value.size() > 256) continue;
                 String val = it->value;
-                if (globalKeys) val = CryptItem::decrypt(val, *globalKeys);
+                if (globalKeys) {
+                    val = CryptItem::decrypt(val, *globalKeys);
+                } else {
+                    for (auto it2 = row.begin(); it2 != row.end(); ++it2) {
+                        String dummy;
+                        Array<String> tempKeys; tempKeys.push(it2->value);
+                        String dec = CryptItem::decrypt(val, tempKeys, &dummy);
+                        if (!dummy.isEmpty()) { val = dec; break; }
+                    }
+                }
                 if (!colHashIndex.has(it->key)) colHashIndex.set(it->key, Map<String, Array<u64>>());
                 colHashIndex.get(it->key)->operator[](val).push(rId);
             }
         }
+
         colBloomFiltersDirty = true;
         return 0;
     }
@@ -2085,37 +2600,78 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
         Map<String, String>* row = fetchRow(rId);
         if (!row) return;
 
+        String oldIdVal = getDecryptedVal(*row, "id", this);
         currentMemoryBytes -= approxRowBytes(*row);
         String keyToUse = encryptionKey;
-        if (keyToUse.isEmpty() && globalKeys) {
-            for (const auto& existingCol : columns) {
-                ParsedCol pc = parseCol(existingCol.col);
-                if (row->has(pc.name)) {
-                    String dummyKey;
-                    CryptItem::decrypt(*row->get(pc.name), *globalKeys, &dummyKey);
-                    if (!dummyKey.isEmpty()) {
-                        keyToUse = dummyKey;
-                        break;
+        if (keyToUse.isEmpty()) {
+            if (globalKeys) {
+                for (const auto& existingCol : columns) {
+                    ParsedCol pc = parseCol(existingCol.col);
+                    if (row->has(pc.name)) {
+                        String dummyKey;
+                        CryptItem::decrypt(*row->get(pc.name), *globalKeys, &dummyKey);
+                        if (!dummyKey.isEmpty()) {
+                            keyToUse = dummyKey;
+                            break;
+                        }
                     }
+                }
+            } else {
+                for (auto it = row->begin(); it != row->end(); ++it) {
+                    for (const auto& existingCol : columns) {
+                        ParsedCol pc = parseCol(existingCol.col);
+                        if (row->has(pc.name)) {
+                            String dummyKey;
+                            Array<String> tempKeys; tempKeys.push(it->value);
+                            CryptItem::decrypt(*row->get(pc.name), tempKeys, &dummyKey);
+                            if (!dummyKey.isEmpty()) {
+                                keyToUse = dummyKey;
+                                break;
+                            }
+                        }
+                    }
+                    if (!keyToUse.isEmpty()) break;
                 }
             }
         }
 
+
         for (const auto& col : columns) {
             ParsedCol pc = parseCol(col.col);
-            if (pc.type == ColType::WATCH) continue; // Skip watch in updates
+            // Skip special directives in updates too
+            if (pc.name == "::id" || pc.name == "::now" || pc.name == "::volatile") continue;
+            if (pc.type == ColType::WATCH) continue; // ::watch columns not stored
+
+            // Handle ::remove on update — set or clear the remove timestamp
+            if (pc.name == "::remove") {
+                if (col.val == "" || col.val == "0") {
+                    row->remove("::remove");
+                } else {
+                    row->set("::remove", keyToUse.isEmpty() ? col.val : CryptItem::encrypt(col.val, keyToUse));
+                }
+                continue;
+            }
 
             String oldBlobHashToDecrement;
             if (row->has(pc.name)) {
                 String oldV = *row->get(pc.name);
-                if (globalKeys) oldV = CryptItem::decrypt(oldV, *globalKeys);
-                else if (!keyToUse.isEmpty()) {
+                if (globalKeys) {
+                    oldV = CryptItem::decrypt(oldV, *globalKeys);
+                } else if (!keyToUse.isEmpty()) {
                     Array<String> tempKeys; tempKeys.push(keyToUse);
                     oldV = CryptItem::decrypt(oldV, tempKeys);
+                } else {
+                    for (auto it2 = row->begin(); it2 != row->end(); ++it2) {
+                        String dummy;
+                        Array<String> tempKeys; tempKeys.push(it2->value);
+                        String dec = CryptItem::decrypt(oldV, tempKeys, &dummy);
+                        if (!dummy.isEmpty()) { oldV = dec; break; }
+                    }
                 }
                 if (isBlobRef(oldV)) {
                     oldBlobHashToDecrement = extractBlobHash(oldV);
                 }
+
 
                 // Remove rId from colHashIndex[pc.name][oldV]
                 if (!colHashIndexDirty && pc.name != "content" && oldV.size() <= 256 && colHashIndex.has(pc.name)) {
@@ -2133,47 +2689,139 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
                 }
             }
 
+            String storedVal = col.val;
+            if (storedVal != "") {
+                if (isCanonicalPureNumerical(storedVal)) {
+                    errno = 0;
+                    unsigned long long valULL = std::strtoull((const char*)storedVal.data(), nullptr, 10);
+                    if (errno != ERANGE) {
+                        storedVal = String((u64)valULL);
+                    }
+                } else if (isCanonicalNumericalArray(storedVal)) {
+                    Array<String> parts = storedVal.split(",");
+                    String canonicalArray = "";
+                    bool anyError = false;
+                    for (usz j = 0; j < parts.size(); ++j) {
+                        if (j > 0) canonicalArray += ",";
+                        errno = 0;
+                        unsigned long long pULL = std::strtoull((const char*)parts[j].data(), nullptr, 10);
+                        if (errno == ERANGE) {
+                            anyError = true;
+                            break;
+                        }
+                        canonicalArray += String((u64)pULL);
+                    }
+                    if (!anyError) {
+                        storedVal = canonicalArray;
+                    }
+                }
+            }
+
             if (col.val == "") {
                 // Setting a column to "" means removing that column
                 if (row->has(pc.name)) {
                     row->remove(pc.name);
                 }
+            } else if (pc.type == ColType::BID && blobStore) {
+                // BID update: store user-supplied blob hash directly as ref
+                String ref = makeBlobRef(storedVal);
+                row->set(pc.name, keyToUse.isEmpty() ? ref : CryptItem::encrypt(ref, keyToUse));
             } else if (pc.type == ColType::BLOB && blobStore) {
-                String content = col.val;
+                String content = storedVal;
                 // Handle partial blob writes
                 if (pc.rangeSpec.size() > 0) {
                     BlobRange br = parseBlobRange(pc.rangeSpec);
                     if (br.valid && row->has(pc.name)) {
                         String existing = resolveValue(*row->get(pc.name));
-                        content = applyBlobRange(existing, col.val, br);
+                        content = applyBlobRange(existing, storedVal, br);
                     }
                 }
-                String hash = Security::hash(content, 16);
-                blobStore->writeHash(hash, 0, content, keyToUse, oldBlobHashToDecrement, currentSeq);
-                incrementBlobRef(hash);
-                String ref = makeBlobRef(hash);
+                String hashVal = Ksee::hash(content, 16);
+                blobStore->writeHash(hashVal, 0, content, keyToUse, oldBlobHashToDecrement, currentSeq);
+                incrementBlobRef(hashVal);
+                String ref = makeBlobRef(hashVal);
                 row->set(pc.name, keyToUse.isEmpty() ? ref : CryptItem::encrypt(ref, keyToUse));
             } else {
-                row->set(pc.name, keyToUse.isEmpty() ? col.val : CryptItem::encrypt(col.val, keyToUse));
+                // String or other type with range slicing (e.g. content[3:5])
+                String updatedVal = storedVal;
+                if (pc.rangeSpec.size() > 0) {
+                    BlobRange br = parseBlobRange(pc.rangeSpec);
+                    if (br.valid && row->has(pc.name)) {
+                        String existing = *row->get(pc.name);
+                        if (globalKeys) existing = CryptItem::decrypt(existing, *globalKeys);
+                        else if (!keyToUse.isEmpty()) {
+                            Array<String> tempKeys; tempKeys.push(keyToUse);
+                            existing = CryptItem::decrypt(existing, tempKeys);
+                        }
+                        updatedVal = applyBlobRange(existing, storedVal, br);
+                    }
+                }
+                row->set(pc.name, keyToUse.isEmpty() ? updatedVal : CryptItem::encrypt(updatedVal, keyToUse));
             }
+
+
 
             // Add newVal to colHashIndex[pc.name][newVal] (only if column was not removed)
             if (col.val != "" && !colHashIndexDirty && pc.name != "content" && row->has(pc.name)) {
                 String newVal = *row->get(pc.name);
                 if (newVal.size() <= 256) {
-                    if (globalKeys) newVal = CryptItem::decrypt(newVal, *globalKeys);
-                    else if (!keyToUse.isEmpty()) {
+                    if (globalKeys) {
+                        newVal = CryptItem::decrypt(newVal, *globalKeys);
+                    } else if (!keyToUse.isEmpty()) {
                         Array<String> tempKeys; tempKeys.push(keyToUse);
                         newVal = CryptItem::decrypt(newVal, tempKeys);
+                    } else {
+                        for (auto it2 = row->begin(); it2 != row->end(); ++it2) {
+                            String dummy;
+                            Array<String> tempKeys; tempKeys.push(it2->value);
+                            String dec = CryptItem::decrypt(newVal, tempKeys, &dummy);
+                            if (!dummy.isEmpty()) { newVal = dec; break; }
+                        }
                     }
                     if (!colHashIndex.has(pc.name)) colHashIndex.set(pc.name, Map<String, Array<u64>>());
                     colHashIndex.get(pc.name)->operator[](newVal).push(rId);
                 }
             }
 
+
             // Decrement old blob ref now that the new value has been set
             if (!oldBlobHashToDecrement.isEmpty()) {
                 decrementBlobRef(oldBlobHashToDecrement);
+            }
+        }
+
+        // ID Renting / claiming on update
+        String newIdVal = getDecryptedVal(*row, "id", this);
+        if (oldIdVal != newIdVal) {
+            if (!oldIdVal.isEmpty()) {
+                u64 oldIdNum = (u64)strtoull((const char*)oldIdVal.data(), nullptr, 10);
+                bool used = false;
+                for (u64 otherRId : allRowIds) {
+                    if (otherRId == rId) continue;
+                    Map<String, String>* otherRow = fetchRow(otherRId);
+                    if (otherRow && getDecryptedVal(*otherRow, "id", this) == oldIdVal) {
+                        used = true;
+                        break;
+                    }
+                }
+                if (!used && oldIdNum > 0) {
+                    rentId(oldIdNum);
+                }
+            }
+            if (!newIdVal.isEmpty()) {
+                u64 newIdNum = (u64)strtoull((const char*)newIdVal.data(), nullptr, 10);
+                if (newIdNum > largestAutoId) {
+                    largestAutoId = newIdNum;
+                    idPoolDirty = true;
+                }
+                for (usz i = 0; i < rentedIds.size(); ++i) {
+                    if (rentedIds[i] == newIdNum) {
+                        rentedIds[i] = rentedIds[rentedIds.size() - 1];
+                        rentedIds.pop();
+                        idPoolDirty = true;
+                        break;
+                    }
+                }
             }
         }
 
@@ -2202,7 +2850,7 @@ int TableStore::write(const Array<Clause>& columns, const Array<Clauses>& clause
 
 // ─── Remove ─────────────────────────────────────────────────────────────────
 
-bool TableStore::rm(const Array<Clauses>& clauses, u64 length, bool burn) {
+bool TableStore::rm(const Array<Clauses>& clauses, u64 length, bool burn, u64 now) {
     Array<u64> toRemove = getMatchingRowIds(clauses, currentSeq, 0);
 
     // Lock check: if any matching items are locked, fail the entire operation
@@ -2218,6 +2866,24 @@ bool TableStore::rm(const Array<Clauses>& clauses, u64 length, bool burn) {
         u64 rId = toRemove[i];
         Map<String, String>* row = fetchRow(rId);
         if (row) {
+            // ID Renting on deletion
+            String idVal = getDecryptedVal(*row, "id", this);
+            if (!idVal.isEmpty()) {
+                u64 idNum = (u64)strtoull((const char*)idVal.data(), nullptr, 10);
+                bool used = false;
+                for (u64 otherRId : allRowIds) {
+                    if (otherRId == rId) continue;
+                    Map<String, String>* otherRow = fetchRow(otherRId);
+                    if (otherRow && getDecryptedVal(*otherRow, "id", this) == idVal) {
+                        used = true;
+                        break;
+                    }
+                }
+                if (!used && idNum > 0) {
+                    rentId(idNum);
+                }
+            }
+
             // Remove from HNSW if it has embedding
             if (row->has("embedding") && hnsw) {
                 hnsw->remove(rId);
@@ -2302,28 +2968,13 @@ void TableStore::flushAllRows() {
     if (!writeBlob) return;
     for (auto it = dirtyBlocks.begin(); it != dirtyBlocks.end(); ++it) {
         if (it->value) {
-            u64 blockId = it->key;
-            
-            // Write persistent rows
-            String data;
-            serializeBlock(blockId, data, false);
-            if (!data.isEmpty()) {
-                writeBlob("ROW_BLOCK_" + String::from(blockId), data);
-            }
-            
-            // Write volatile SWAP rows
-            String volData;
-            serializeBlock(blockId, volData, true);
-            if (!volData.isEmpty()) {
-                writeBlob("VOLATILE_BLOCK_" + String::from(blockId), volData);
-            } else {
-                if (blobStore) blobStore->removeHash("VOLATILE_BLOCK_" + String::from(blockId));
-            }
-            
-            it->value = false;
+            flushDirtyBlock(it->key);
         }
     }
+    // Persist the ID rent pool
+    saveIdPool();
 }
+
 
 bool TableStore::loadBlock(u64 blockId) {
     if (!readBlob) return false;
@@ -2407,17 +3058,92 @@ void TableStore::serializeBlock(u64 blockId, String& out, bool volatileOnly) {
         String name = colNames[c];
         writeVLU(payload, name.size());
         payload += name;
-        payload += (char)TypeTag::STRING;
+        
+        // Determine column type tag (String, I64, or TENSOR)
+        TypeTag colType = TypeTag::I64;
+        bool hasValues = false;
+        bool allPureNumerical = true;
+        bool allNumericalArrays = true;
         
         for (u32 i = 0; i < rowCount; ++i) {
             Map<String, String>* row = rows[i];
-            String val = (row && row->has(name)) ? *row->get(name) : String();
-            writeVLU(payload, val.size());
+            if (row && row->has(name)) {
+                String val = *row->get(name);
+                if (!val.isEmpty()) {
+                    hasValues = true;
+                    if (!isCanonicalPureNumerical(val)) {
+                        allPureNumerical = false;
+                    } else {
+                        errno = 0;
+                        std::strtoull((const char*)val.data(), nullptr, 10);
+                        if (errno == ERANGE) {
+                            allPureNumerical = false;
+                        }
+                    }
+                    if (!isCanonicalNumericalArray(val)) {
+                        allNumericalArrays = false;
+                    } else {
+                        Array<String> parts = val.split(",");
+                        for (usz j = 0; j < parts.size(); ++j) {
+                            errno = 0;
+                            std::strtoull((const char*)parts[j].data(), nullptr, 10);
+                            if (errno == ERANGE) {
+                                allNumericalArrays = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         }
+        
+        if (!hasValues) {
+            colType = TypeTag::STRING;
+        } else if (allPureNumerical) {
+            colType = TypeTag::I64;
+        } else if (allNumericalArrays) {
+            colType = TypeTag::TENSOR;
+        } else {
+            colType = TypeTag::STRING;
+        }
+        
+        payload += (char)colType;
+        
+        // Write lengths
         for (u32 i = 0; i < rowCount; ++i) {
             Map<String, String>* row = rows[i];
             String val = (row && row->has(name)) ? *row->get(name) : String();
-            payload += val;
+            if (val.isEmpty()) {
+                writeVLU(payload, 0);
+            } else if (colType == TypeTag::I64) {
+                writeVLU(payload, 8);
+            } else if (colType == TypeTag::TENSOR) {
+                Array<String> parts = val.split(",");
+                writeVLU(payload, parts.size() * 8);
+            } else {
+                writeVLU(payload, val.size());
+            }
+        }
+        
+        // Write values
+        for (u32 i = 0; i < rowCount; ++i) {
+            Map<String, String>* row = rows[i];
+            String val = (row && row->has(name)) ? *row->get(name) : String();
+            if (val.isEmpty()) {
+                continue;
+            }
+            if (colType == TypeTag::I64) {
+                unsigned long long valULL = std::strtoull((const char*)val.data(), nullptr, 10);
+                payload += String((const u8*)&valULL, 8);
+            } else if (colType == TypeTag::TENSOR) {
+                Array<String> parts = val.split(",");
+                for (usz j = 0; j < parts.size(); ++j) {
+                    unsigned long long valULL = std::strtoull((const char*)parts[j].data(), nullptr, 10);
+                    payload += String((const u8*)&valULL, 8);
+                }
+            } else {
+                payload += val;
+            }
         }
     }
     
@@ -2522,7 +3248,7 @@ void TableStore::deserializeBlock(u64 blockId, const String& in, bool isVolatile
         String colName((const u8*)p, nameLen);
         p += nameLen;
         
-        p++; // skip typeTag
+        TypeTag colType = (TypeTag)*p++;
         
         Array<u64> lens;
         lens.allocate(rowCount);
@@ -2532,9 +3258,32 @@ void TableStore::deserializeBlock(u64 blockId, const String& in, bool isVolatile
         for (u32 i = 0; i < rowCount; ++i) {
             u64 len = lens[i];
             if (pEnd - p < (ptrdiff_t)len) break;
-            String val((const u8*)p, len);
-            p += len;
-            if (len > 0) {
+            
+            if (len == 0) {
+                continue;
+            }
+            
+            if (colType == TypeTag::I64) {
+                if (len == 8) {
+                    unsigned long long valULL = *(const unsigned long long*)p;
+                    p += 8;
+                    rows[i].set(colName, String(valULL));
+                } else {
+                    p += len;
+                }
+            } else if (colType == TypeTag::TENSOR) {
+                u32 count = len / 8;
+                String valStr;
+                for (u32 j = 0; j < count; ++j) {
+                    unsigned long long valULL = *(const unsigned long long*)p;
+                    p += 8;
+                    if (j > 0) valStr += ",";
+                    valStr += String(valULL);
+                }
+                rows[i].set(colName, valStr);
+            } else {
+                String val((const u8*)p, len);
+                p += len;
                 rows[i].set(colName, val);
             }
         }
@@ -2547,6 +3296,16 @@ void TableStore::deserializeBlock(u64 blockId, const String& in, bool isVolatile
         allRows.set(rowIds[i], rows[i]);
         if (isVolatile) volatileRows.set(rowIds[i], true);
         currentMemoryBytes += approxRowBytes(rows[i]);
+        if (rowIds[i] >= nextRowId) nextRowId = rowIds[i] + 1;
+
+        String idVal;
+        if (rows[i].has("::id")) idVal = *rows[i].get("::id");
+        else if (rows[i].has("id")) idVal = *rows[i].get("id");
+        if (!idVal.isEmpty()) {
+            if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+            u64 idNum = (u64)strtoull((const char*)idVal.data(), nullptr, 10);
+            if (idNum > largestAutoId) { largestAutoId = idNum; idPoolDirty = true; }
+        }
     }
 }
 
@@ -2557,17 +3316,44 @@ void TableStore::flushHnsw() {
     }
 }
 
-static String getFullPath(u64 rId, TableStore* store) {
+static String getFullPath(u64 rId, TableStore* store, u64 snapshotSeq = 0) {
     u64 currentId = rId;
     int depth = 0;
     String path;
     while (currentId != 0 && depth < 20) {
-        Map<String, String>* row = store->fetchRow(currentId);
+        Map<String, String>* row = store->fetchRowForSnapshot(currentId, snapshotSeq);
         if (!row) break;
         String name = row->has("name") ? *row->get("name") : "";
-        if (store->globalKeys) name = CryptItem::decrypt(name, *store->globalKeys);
-        String pId = row->has("parent_id") ? *row->get("parent_id") : "";
-        if (store->globalKeys) pId = CryptItem::decrypt(pId, *store->globalKeys);
+        if (!name.isEmpty()) {
+            if (store->globalKeys) {
+                name = CryptItem::decrypt(name, *store->globalKeys);
+            } else {
+                for (auto it = row->begin(); it != row->end(); ++it) {
+                    String dummy;
+                    Array<String> tempKeys; tempKeys.push(it->value);
+                    String dec = CryptItem::decrypt(name, tempKeys, &dummy);
+                    if (!dummy.isEmpty()) { name = dec; break; }
+                }
+            }
+        }
+
+        String pId;
+        if (row->has("::parent")) pId = *row->get("::parent");
+        else if (row->has("parent_id")) pId = *row->get("parent_id");
+
+        if (!pId.isEmpty()) {
+            if (store->globalKeys) {
+                pId = CryptItem::decrypt(pId, *store->globalKeys);
+            } else {
+                for (auto it = row->begin(); it != row->end(); ++it) {
+                    String dummy;
+                    Array<String> tempKeys; tempKeys.push(it->value);
+                    String dec = CryptItem::decrypt(pId, tempKeys, &dummy);
+                    if (!dummy.isEmpty()) { pId = dec; break; }
+                }
+            }
+        }
+
         
         if (path.isEmpty()) {
             path = name;
@@ -2581,13 +3367,15 @@ static String getFullPath(u64 rId, TableStore* store) {
         if (store->colHashIndexDirty) {
             store->rebuildColHashIndex();
         }
-        auto* valMap = store->colHashIndex.get("id");
+        auto* valMap = store->colHashIndex.get("::id");
+        if (!valMap) valMap = store->colHashIndex.get("id");
         if (valMap && valMap->has(pId)) {
             const auto& rIds = *valMap->get(pId);
             if (rIds.size() > 0) {
                 parentRId = rIds[0];
             }
         }
+
         if (parentRId == 0) break;
         currentId = parentRId;
         depth++;
@@ -2596,6 +3384,7 @@ static String getFullPath(u64 rId, TableStore* store) {
 }
 
 Array<u64> TableStore::resolvePathPattern(const String& colName, const String& pathPattern, u64 snapshotSeq, u64 txId) {
+#define fetchRow(id) fetchRowForSnapshot(id, snapshotSeq)
     Array<u64> matchingRowIds;
     Array<u64> finalMatches;
     
@@ -2608,7 +3397,12 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
     }
     
     Array<String> currentParentVals;
+    currentParentVals.push("0");
     currentParentVals.push("");
+
+    if (colHashIndexDirty) {
+        rebuildColHashIndex();
+    }
 
     Map<String, u64> idToRowId;
     Map<String, Array<u64>> parentToRowIds;
@@ -2617,17 +3411,47 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
         Map<String, String>* row = fetchRow(rId);
         if (!row) continue;
         
-        String idVal = row->has("id") ? *row->get("id") : "";
-        if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+        String idVal;
+        if (row->has("::id")) idVal = *row->get("::id");
+        else if (row->has("id")) idVal = *row->get("id");
+
         if (!idVal.isEmpty()) {
+            if (globalKeys) {
+                idVal = CryptItem::decrypt(idVal, *globalKeys);
+            } else {
+                // local decrypt try
+                for (auto it = row->begin(); it != row->end(); ++it) {
+                    String dummy;
+                    Array<String> tempKeys; tempKeys.push(it->value);
+                    String dec = CryptItem::decrypt(idVal, tempKeys, &dummy);
+                    if (!dummy.isEmpty()) { idVal = dec; break; }
+                }
+            }
             idToRowId.set(idVal, rId);
         }
         
-        String pId = row->has("parent_id") ? *row->get("parent_id") : "";
-        if (globalKeys) pId = CryptItem::decrypt(pId, *globalKeys);
+        String pId;
+        if (row->has("::parent")) pId = *row->get("::parent");
+        else if (row->has("parent_id")) pId = *row->get("parent_id");
+
+        if (!pId.isEmpty()) {
+            if (globalKeys) {
+                pId = CryptItem::decrypt(pId, *globalKeys);
+            } else {
+                // local decrypt try
+                for (auto it = row->begin(); it != row->end(); ++it) {
+                    String dummy;
+                    Array<String> tempKeys; tempKeys.push(it->value);
+                    String dec = CryptItem::decrypt(pId, tempKeys, &dummy);
+                    if (!dummy.isEmpty()) { pId = dec; break; }
+                }
+            }
+        }
+
         parentToRowIds[pId].push(rId);
     }
-    
+
+
     for (usz step = 0; step < cleanParts.size(); ++step) {
         const String& seg = cleanParts[step];
         Array<String> nextParentVals;
@@ -2642,8 +3466,21 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
                         u64 rId = childIds[k];
                         Map<String, String>* row = fetchRow(rId);
                         if (!row) continue;
-                        String idVal = row->has("id") ? *row->get("id") : "";
-                        if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+                        String idVal;
+                        if (row->has("::id")) idVal = *row->get("::id");
+                        else if (row->has("id")) idVal = *row->get("id");
+                        if (!idVal.isEmpty()) {
+                            if (globalKeys) {
+                                idVal = CryptItem::decrypt(idVal, *globalKeys);
+                            } else {
+                                for (auto it = row->begin(); it != row->end(); ++it) {
+                                    String dummy;
+                                    Array<String> tempKeys; tempKeys.push(it->value);
+                                    String dec = CryptItem::decrypt(idVal, tempKeys, &dummy);
+                                    if (!dummy.isEmpty()) { idVal = dec; break; }
+                                }
+                            }
+                        }
                         if (!idVal.isEmpty()) {
                             nextParentVals.push(idVal);
                             stepMatchingRowIds.push(rId);
@@ -2651,6 +3488,7 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
                     }
                 }
             }
+
         } else if (seg == "**") {
             Array<String> descendants = currentParentVals;
             
@@ -2674,8 +3512,21 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
                         u64 rId = childIds[k];
                         Map<String, String>* row = fetchRow(rId);
                         if (!row) continue;
-                        String idVal = row->has("id") ? *row->get("id") : "";
-                        if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+                        String idVal;
+                        if (row->has("::id")) idVal = *row->get("::id");
+                        else if (row->has("id")) idVal = *row->get("id");
+                        if (!idVal.isEmpty()) {
+                            if (globalKeys) {
+                                idVal = CryptItem::decrypt(idVal, *globalKeys);
+                            } else {
+                                for (auto it = row->begin(); it != row->end(); ++it) {
+                                    String dummy;
+                                    Array<String> tempKeys; tempKeys.push(it->value);
+                                    String dec = CryptItem::decrypt(idVal, tempKeys, &dummy);
+                                    if (!dummy.isEmpty()) { idVal = dec; break; }
+                                }
+                            }
+                        }
                         if (!idVal.isEmpty() && !visited.has(idVal)) {
                             visited.set(idVal, true);
                             descendants.push(idVal);
@@ -2708,7 +3559,18 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
                         if (!row) continue;
                         
                         String segVal = row->has(colName) ? *row->get(colName) : "";
-                        if (globalKeys) segVal = CryptItem::decrypt(segVal, *globalKeys);
+                        if (!segVal.isEmpty()) {
+                            if (globalKeys) {
+                                segVal = CryptItem::decrypt(segVal, *globalKeys);
+                            } else {
+                                for (auto it = row->begin(); it != row->end(); ++it) {
+                                    String dummy;
+                                    Array<String> tempKeys; tempKeys.push(it->value);
+                                    String dec = CryptItem::decrypt(segVal, tempKeys, &dummy);
+                                    if (!dummy.isEmpty()) { segVal = dec; break; }
+                                }
+                            }
+                        }
                         
                         bool isMatch = false;
                         if (segIsPattern) {
@@ -2716,14 +3578,40 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
                         } else {
                             if (segVal == "**") {
                                 finalMatches.push(rId);
-                                String idVal = row->has("id") ? *row->get("id") : "";
-                                if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+                                String idVal;
+                                if (row->has("::id")) idVal = *row->get("::id");
+                                else if (row->has("id")) idVal = *row->get("id");
+                                if (!idVal.isEmpty()) {
+                                    if (globalKeys) {
+                                        idVal = CryptItem::decrypt(idVal, *globalKeys);
+                                    } else {
+                                        for (auto it = row->begin(); it != row->end(); ++it) {
+                                            String dummy;
+                                            Array<String> tempKeys; tempKeys.push(it->value);
+                                            String dec = CryptItem::decrypt(idVal, tempKeys, &dummy);
+                                            if (!dummy.isEmpty()) { idVal = dec; break; }
+                                        }
+                                    }
+                                }
                                 if (!idVal.isEmpty()) {
                                     nextParentVals.push(idVal);
                                 }
                             } else if (segVal == "*") {
-                                String idVal = row->has("id") ? *row->get("id") : "";
-                                if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+                                String idVal;
+                                if (row->has("::id")) idVal = *row->get("::id");
+                                else if (row->has("id")) idVal = *row->get("id");
+                                if (!idVal.isEmpty()) {
+                                    if (globalKeys) {
+                                        idVal = CryptItem::decrypt(idVal, *globalKeys);
+                                    } else {
+                                        for (auto it = row->begin(); it != row->end(); ++it) {
+                                            String dummy;
+                                            Array<String> tempKeys; tempKeys.push(it->value);
+                                            String dec = CryptItem::decrypt(idVal, tempKeys, &dummy);
+                                            if (!dummy.isEmpty()) { idVal = dec; break; }
+                                        }
+                                    }
+                                }
                                 if (!idVal.isEmpty()) {
                                     nextParentVals.push(idVal);
                                     stepMatchingRowIds.push(rId);
@@ -2734,8 +3622,21 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
                         }
                         
                         if (isMatch) {
-                            String idVal = row->has("id") ? *row->get("id") : "";
-                            if (globalKeys) idVal = CryptItem::decrypt(idVal, *globalKeys);
+                            String idVal;
+                            if (row->has("::id")) idVal = *row->get("::id");
+                            else if (row->has("id")) idVal = *row->get("id");
+                            if (!idVal.isEmpty()) {
+                                if (globalKeys) {
+                                    idVal = CryptItem::decrypt(idVal, *globalKeys);
+                                } else {
+                                    for (auto it = row->begin(); it != row->end(); ++it) {
+                                        String dummy;
+                                        Array<String> tempKeys; tempKeys.push(it->value);
+                                        String dec = CryptItem::decrypt(idVal, tempKeys, &dummy);
+                                        if (!dummy.isEmpty()) { idVal = dec; break; }
+                                    }
+                                }
+                            }
                             if (!idVal.isEmpty()) {
                                 nextParentVals.push(idVal);
                                 stepMatchingRowIds.push(rId);
@@ -2744,6 +3645,7 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
                     }
                 }
             }
+
         }
         
         currentParentVals = nextParentVals;
@@ -2768,7 +3670,8 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
     // Fallback: check full path of all visible rows directly against pathPattern
     for (u64 rId : allRowIds) {
         if (!isVisibleToSnapshot(rId, snapshotSeq, txId)) continue;
-        String fullPath = getFullPath(rId, this);
+        String fullPath = getFullPath(rId, this, snapshotSeq);
+
         
         String cleanPattern = p;
         if (cleanPattern.startsWith("/")) cleanPattern = cleanPattern.substring(1);
@@ -2788,8 +3691,10 @@ Array<u64> TableStore::resolvePathPattern(const String& colName, const String& p
                 matchingRowIds.push(rId);
             }
         }
+
     }
     
+    #undef fetchRow
     return matchingRowIds;
 }
 

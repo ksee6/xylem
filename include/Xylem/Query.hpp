@@ -1,12 +1,12 @@
 #ifndef XYLEM_QUERY_HPP
 #define XYLEM_QUERY_HPP
 
-#include <Collection/String.hpp>
-#include <Collection/Array.hpp>
+#include <Ksee/String.hpp>
+#include <Ksee/Array.hpp>
 
 namespace Xylem {
 
-using namespace Collection;
+using namespace Ksee;
 
 struct Clause {
     String col;
@@ -23,11 +23,12 @@ struct Clauses : public Array<Clause> {
 
 // ─── Column Type System ──────────────────────────────────────────────────────
 
-enum class ColType : u8 { STRING, BLOB, WATCH };
+enum class ColType : u8 { STRING, BLOB, WATCH, BID };
+// BID = blob-id: the user writes the 16-byte hash directly, no hashing step
 
 struct ParsedCol {
     String name;       // "content" (suffix stripped)
-    ColType type;      // BLOB, WATCH, or STRING
+    ColType type;      // BLOB, WATCH, BID, or STRING
     String rangeSpec;  // "[0:20]", "[30:]", "[30+]", "[+]", or empty
 };
 
@@ -40,13 +41,34 @@ struct BlobRange {
     bool valid;    // whether a range was specified at all
 };
 
-// Parse "content:blob[0:20]" → {name="content", type=BLOB, range="[0:20]"}
-// Parse "_cmd:watch"          → {name="_cmd",    type=WATCH, range=""}
-// Parse "_cmd"                → {name="_cmd",    type=WATCH, range=""} (auto)
-// Parse "status"              → {name="status",  type=STRING,  range=""}
+// Parse column specifiers:
+//   "content::blob[0:20]" → {name="content", type=BLOB, range="[0:20]"}
+//   "content::blob"       → {name="content", type=BLOB, range=""}
+//   "content::bid"        → {name="content", type=BID, range=""}   (raw blob-id insert)
+//   "content::bid[0:5]"   → {name="content", type=BID, range="[0:5]"}
+//   "cmd::watch"          → {name="cmd",     type=WATCH, range=""}
+//   "::volatile"          → {name="::volatile", type=STRING} (special directive)
+//   "status"              → {name="status",  type=STRING, range=""}
+// Backward-compatible: ":blob" and ":watch" (single colon) still accepted
 inline ParsedCol parseCol(const String& raw) {
     ParsedCol result;
     result.type = ColType::STRING;
+
+    // Preserve special :: directives as-is (::volatile, ::remove, ::id, ::now)
+    if (raw.size() >= 2 && raw[0] == ':' && raw[1] == ':') {
+        // Check if it has a range spec
+        long long bracketPos = -1;
+        for (usz i = 0; i < raw.size(); ++i) {
+            if (raw[i] == '[') { bracketPos = (long long)i; break; }
+        }
+        if (bracketPos >= 0) {
+            result.name = raw.slice(0, bracketPos);
+            result.rangeSpec = raw.slice(bracketPos);
+        } else {
+            result.name = raw;
+        }
+        return result;
+    }
 
     // Find range spec [...]
     long long bracketPos = -1;
@@ -57,24 +79,38 @@ inline ParsedCol parseCol(const String& raw) {
     String nameAndType = (bracketPos >= 0) ? raw.slice(0, bracketPos) : raw;
     result.rangeSpec = (bracketPos >= 0) ? raw.slice(bracketPos) : String();
 
-    // Find type suffix :blob or :watch
-    long long colonPos = -1;
-    for (usz i = 0; i < nameAndType.size(); ++i) {
-        if (nameAndType[i] == ':') { colonPos = (long long)i; break; }
+    // Find type suffix: ::blob, ::watch, ::bid  (double-colon preferred)
+    // Also accept legacy single-colon :blob :watch
+    long long dcPos = -1; // double-colon position
+    for (usz i = 0; i + 1 < nameAndType.size(); ++i) {
+        if (nameAndType[i] == ':' && nameAndType[i+1] == ':') {
+            dcPos = (long long)i; break;
+        }
     }
 
-    if (colonPos >= 0) {
-        result.name = nameAndType.slice(0, colonPos);
-        String suffix = nameAndType.slice(colonPos + 1);
+    if (dcPos >= 0) {
+        result.name = nameAndType.slice(0, dcPos);
+        String suffix = nameAndType.slice(dcPos + 2); // skip ::
         if (suffix == "blob") result.type = ColType::BLOB;
         else if (suffix == "watch") result.type = ColType::WATCH;
+        else if (suffix == "bid") result.type = ColType::BID;
+        // else STRING (unknown suffix treated as STRING)
     } else {
-        result.name = nameAndType;
-    }
-
-    // Auto-detect _ prefix as WATCH
-    if (result.type == ColType::STRING && result.name.size() > 0 && result.name[0] == '_') {
-        result.type = ColType::WATCH;
+        // Legacy single-colon check
+        long long colonPos = -1;
+        for (usz i = 0; i < nameAndType.size(); ++i) {
+            if (nameAndType[i] == ':') { colonPos = (long long)i; break; }
+        }
+        if (colonPos >= 0) {
+            result.name = nameAndType.slice(0, colonPos);
+            String suffix = nameAndType.slice(colonPos + 1);
+            if (suffix == "blob") result.type = ColType::BLOB;
+            else if (suffix == "watch") result.type = ColType::WATCH;
+            else if (suffix == "bid") result.type = ColType::BID;
+            else result.name = nameAndType; // not a known suffix, keep whole name
+        } else {
+            result.name = nameAndType;
+        }
     }
 
     return result;

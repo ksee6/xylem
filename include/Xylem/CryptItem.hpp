@@ -1,16 +1,16 @@
 #ifndef XYLEM_CRYPTITEM_HPP
 #define XYLEM_CRYPTITEM_HPP
 
-#include <Collection/String.hpp>
-#include <Collection/Array.hpp>
-#include <Security/Crypto.hpp>
-#include <Xi/Random.hpp>
+#include <Ksee/String.hpp>
+#include <Ksee/Array.hpp>
+#include <Ksee/Crypto/Chacha.hpp>
+#include <Ksee/Math/Random.hpp>
 #include <Xylem/Format.hpp>
 #include <stdio.h>
 
 namespace Xylem {
 
-using namespace Collection;
+using namespace Ksee;
 
 // NOTE: CRC32 is used for accidental corruption detection, NOT for 
 // authenticated encryption. For adversarial tamper resistance, this 
@@ -19,9 +19,9 @@ using namespace Collection;
 struct CryptItem {
     static String encrypt(const String& plaintext, const String& key) {
         if (key.isEmpty()) return plaintext;
-        u64 nonce = ((u64)Xi::randomNext() << 32) | Xi::randomNext();
+        u64 nonce = randomNumber<u64>();
         u32 crc = crc32(plaintext);
-        String cipher = Security::streamXor(key, nonce, plaintext);
+        String cipher = chacha(plaintext, key, nonce);
         
         String res;
         res.allocate(6 + 8 + 4 + cipher.size());
@@ -45,7 +45,7 @@ struct CryptItem {
         String cipher = data.slice(18);
         
         for(const auto& key : keys) {
-            String plain = Security::streamXor(key, nonce, cipher);
+            String plain = chacha(cipher, key, nonce);
             if (crc32(plain) == crc) {
                 if (successfulKey) *successfulKey = key;
                 return plain;

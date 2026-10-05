@@ -3,16 +3,16 @@
 
 #include <Xylem/Format.hpp>
 #include <Xylem/BlockDevice.hpp>
-#include <Collection/Map.hpp>
-#include <Collection/InlineArray.hpp>
+#include <Ksee/Map.hpp>
+#include <Ksee/Array.hpp>
 
 namespace Xylem {
 
-using namespace Collection;
+using namespace Ksee;
 
 struct CacheEntry {
     u32 blockIdx;
-    InlineArray<u8> decompressed;
+    Array<u8> decompressed;
     bool dirty;
     u64 accessSeq;
 };
@@ -28,8 +28,8 @@ public:
 
     Cache(BlockDevice* dev, usz maxCache);
 
-    InlineArray<u8> get(u32 blockIdx);
-    void put(u32 blockIdx, const InlineArray<u8>& data);
+    Array<u8> get(u32 blockIdx);
+    void put(u32 blockIdx, const Array<u8>& data);
     void flushAll();
 
 private:

@@ -1,14 +1,13 @@
 #ifndef XYLEM_FORMAT_HPP
 #define XYLEM_FORMAT_HPP
 
-#include <Collection/String.hpp>
-#include <Collection/Array.hpp>
-#include <Xi/Primitives.hpp>
+#include <Ksee/String.hpp>
+#include <Ksee/Array.hpp>
+#include <Ksee/Types.hpp>
 
 namespace Xylem {
 
-using namespace Xi;
-using namespace Collection;
+using namespace Ksee;
 
 enum class TypeTag : u8 {
     BOOL = 0x00,

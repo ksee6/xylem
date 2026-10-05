@@ -1,10 +1,10 @@
 #include <Xylem/Xylem.hpp>
-#include <Terminal/Format.hpp>
+#include <Ksee/Terminal/Format.hpp>
 #include <fcntl.h>
 #include <unistd.h>
 
 using namespace Xylem;
-using namespace Terminal;
+using namespace Ksee;
 
 int main() {
     Info("--- Wildcard Path and Commit Query Unit Tests ---");
